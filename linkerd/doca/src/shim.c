@@ -300,6 +300,12 @@ int32_t dmesh_doca_conn_state_get(struct objects *objs, int32_t slot)
 	return (int32_t)objs->conns[slot].state;
 }
 
+/* Called only after the Rust IO mutex has excluded all staging readers/writers. */
+int32_t dmesh_doca_conn_readers_detached(struct objects *objs, int32_t slot)
+{
+	return (int32_t)dmesh_flow_readers_detached(objs, slot);
+}
+
 void dmesh_doca_stats_get(struct objects *objs,
 			  int64_t *sent, int64_t *recv, int64_t *recv_bytes,
 			  int64_t *dma_pending, int64_t *dma_dropped)
@@ -584,7 +590,8 @@ int32_t dmesh_doca_init(const char *dev_pci_addr,
 	objs = calloc(1, sizeof(*objs));
 	if (objs == NULL)
 		return DOCA_ERROR_NO_MEMORY;
-
+	/* Rust IO may be read by other runtimes; C close must await its ACK. */
+	objs->external_readers = true;
 
 	result = open_doca_device_with_pci(dev_pci_addr, NULL, &objs->dev);
 	if (result != DOCA_SUCCESS)
@@ -630,6 +637,18 @@ void dmesh_doca_comch_destroy(struct objects *handle)
 	if (handle == NULL)
 		return;
 
+	/* A dropped driver cannot prove outstanding Rust references or failed DMA
+	 * quiescence have retired. Retain the whole device domain on this void API. */
+	if (dmesh_objects_have_live_flows(handle)) {
+		fprintf(stderr, "[DMesh] retaining live flow resources after driver drop\n");
+		return;
+	}
+	for (int i = 0; i < DMESH_MAX_SESSIONS; ++i) {
+		if (handle->sessions[i].occupied || handle->sessions[i].sends_pending) {
+			fprintf(stderr, "[DMesh] retaining control session resources after driver drop\n");
+			return;
+		}
+	}
 	/* NOTE: partial teardown. cleanup_objects only releases cc_server/pe/
 	 * rep_dev/dev; consumer/DPA/mmap/buf_arr resources are not yet freed
 	 * (a full teardown is still TODO). */

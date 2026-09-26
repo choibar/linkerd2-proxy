@@ -36,6 +36,7 @@ extern "C" {
 
     fn dmesh_doca_max_conns() -> c_int;
     fn dmesh_doca_conn_state_get(objs: *mut c_void, slot: i32) -> i32;
+    fn dmesh_doca_conn_readers_detached(objs: *mut c_void, slot: i32) -> c_int;
     fn dmesh_doca_conn_flow_get(
         objs: *mut c_void,
         slot: i32,
@@ -111,6 +112,7 @@ pub enum ConnState {
     AwaitMetadata,
     Running,
     Error,
+    Closing,
 }
 
 impl ConnState {
@@ -121,6 +123,7 @@ impl ConnState {
             3 => Self::Running,
             4 => Self::Error,
             5 => Self::ConsumerStarting,
+            6 => Self::Closing,
             _ => Self::Free,
         }
     }
@@ -240,6 +243,19 @@ fn check(code: c_int) -> Result<(), Error> {
     }
 }
 
+/// Clearing both pointers takes the IO mutex, waiting for any concurrent copy.
+/// The C side may release staging only after the acknowledgement succeeds.
+fn detach_readers(
+    handle: &mut Option<crate::DmeshIoHandle>,
+    acknowledge: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if let Some(handle) = handle.take() {
+        handle.clear_tx_staging();
+        handle.clear_rx_staging();
+    }
+    acknowledge()
+}
+
 impl Driver {
     /// Build the driver and its registrar. The event receiver (paired with
     /// `events`) and the `Registrar` are given to the acceptor.
@@ -265,9 +281,18 @@ impl Driver {
     /// Install any pending IO handles, wiring each to its slot's staging region.
     fn drain_registrations(&mut self) {
         while let Ok((slot, handle)) = self.reg_rx.try_recv() {
-            if slot >= MAX_CONNS {
+            if slot >= MAX_CONNS
+                || ConnState::from_raw(unsafe {
+                    dmesh_doca_conn_state_get(self.doca.raw(), slot as i32)
+                }) != ConnState::Running
+            {
+                // A delayed registration must not resurrect a closing flow.
+                handle.clear_tx_staging();
+                handle.clear_rx_staging();
                 continue;
             }
+            // The replaced IO may still be used on another runtime thread.
+            let _ = detach_readers(&mut self.handles[slot], || Ok(()));
             let mut base: *const u8 = std::ptr::null();
             let mut len: usize = 0;
             let rc = unsafe {
@@ -443,6 +468,21 @@ impl Driver {
     }
 
     fn advance(&mut self) -> Result<c_int, Error> {
+        // Backends can be taken by another shard through the shared registry.
+        // Fence their Rust readers/writers before C may destroy any mappings.
+        for slot in 0..MAX_CONNS {
+            let raw = self.doca.raw();
+            if ConnState::from_raw(unsafe { dmesh_doca_conn_state_get(raw, slot as i32) })
+                != ConnState::Closing
+            {
+                continue;
+            }
+            self.tx_set[slot] = false;
+            self.saw_teardown = true;
+            detach_readers(&mut self.handles[slot], || {
+                check(unsafe { dmesh_doca_conn_readers_detached(raw, slot as i32) })
+            })?;
+        }
         let mut state: c_int = 0;
         check(unsafe { dmesh_doca_ctrl_advance(self.doca.raw(), &mut state) })?;
         if state == STATE_ERROR {
@@ -567,8 +607,8 @@ impl Driver {
 
             self.advance()?;
             self.emit_conn_events();
-            // Teardown parked freed-racy buffers in graves; the handles of all
-            // dead slots are marked now, so the regions are unreachable.
+            // Legacy compatibility hook. Native flow mappings are fenced by
+            // the explicit reader acknowledgement before advance().
             unsafe { dmesh_doca_reap_graves(self.doca.raw()) };
             // Install any handles the acceptor registered, then deliver the
             // recv segments the drain above produced to the reading stacks.
@@ -637,5 +677,79 @@ impl Driver {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_fence_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[test]
+    fn closing_has_its_own_state() {
+        assert_eq!(ConnState::from_raw(6), ConnState::Closing);
+        assert_ne!(ConnState::from_raw(6), ConnState::Free);
+    }
+
+    #[test]
+    fn acknowledge_only_after_io_pointers_are_cleared() {
+        let (mut io, handle) = crate::dmesh_io_pair("127.0.0.1:42".parse().unwrap());
+        let rx = vec![1u8; 16];
+        let mut tx = vec![0u8; 16];
+        handle.set_staging(rx.as_ptr() as usize, rx.len());
+        handle.push_segment(0, 8);
+        handle.set_tx_staging(tx.as_mut_ptr() as usize, tx.len());
+        let mut slot = Some(handle);
+        let mut acknowledged = false;
+        detach_readers(&mut slot, || {
+            let waker = Waker::from(Arc::new(Noop));
+            let mut cx = Context::from_waker(&waker);
+            let mut bytes = [0u8; 8];
+            let mut read = ReadBuf::new(&mut bytes);
+            assert!(matches!(
+                Pin::new(&mut io).poll_read(&mut cx, &mut read),
+                Poll::Ready(Ok(()))
+            ));
+            assert!(read.filled().is_empty());
+            assert!(matches!(
+                Pin::new(&mut io).poll_write(&mut cx, b"x"),
+                Poll::Ready(Err(_))
+            ));
+            acknowledged = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(acknowledged && slot.is_none());
+        assert!(tx.iter().all(|byte| *byte == 0));
+        // This represents C releasing the mappings after the acknowledgement.
+        drop(rx);
+        drop(tx);
+    }
+
+    #[test]
+    fn failed_acknowledgement_can_retry_without_reopening_io() {
+        let (_, handle) = crate::dmesh_io_pair("127.0.0.1:42".parse().unwrap());
+        let mut slot = Some(handle);
+        assert!(
+            detach_readers(&mut slot, || Err(Error::new(-1, "injected ack failure"))).is_err()
+        );
+        assert!(slot.is_none());
+        let mut retried = false;
+        detach_readers(&mut slot, || {
+            retried = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(retried);
     }
 }
