@@ -97,6 +97,7 @@ extern "C" {
     // Publish response bytes already staged at [pos, pos+len) (no memcpy).
     // Returns bytes accepted (>=0, may be < len) or a negative doca_error_t.
     fn dmesh_doca_conn_send_staged(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> i32;
+    fn dmesh_doca_conn_shutdown(objs: *mut c_void, slot: i32) -> i32;
 }
 
 /// Global init state (mirrors `enum dmesh_doca_init_state` in comch_server.h)
@@ -392,6 +393,11 @@ impl Driver {
                     break;
                 }
                 // fully accepted; loop to drain the wrapped remainder if any
+            }
+            // End of stream follows the last accepted byte. Flows that cannot
+            // carry it (NOT_SUPPORTED) close through the host as before.
+            if handle.take_fin() {
+                let _ = unsafe { dmesh_doca_conn_shutdown(self.doca.raw(), slot as i32) };
             }
         }
     }

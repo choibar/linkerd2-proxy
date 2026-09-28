@@ -543,6 +543,23 @@ int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot,
 	return (int32_t)sent;
 }
 
+/* The stack shut down its write half and every staged byte was accepted. On a
+ * push flow the host reads end of stream after the last batch; the flow stays
+ * open for the host's bytes until the host closes it. Other flows return
+ * DOCA_ERROR_NOT_SUPPORTED and are unchanged. */
+int32_t dmesh_doca_conn_shutdown(struct objects *objs, int32_t slot)
+{
+	struct dmesh_conn *conn;
+
+	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
+	conn = &objs->conns[slot];
+	if (conn->state != DMESH_CONN_RUNNING || !DMESH_FLOW_USES_PUSH(conn->flow.mode))
+		return -(int32_t)DOCA_ERROR_NOT_SUPPORTED;
+	conn->push_fin_requested = true;
+	return dmesh_dma_push_fin(conn);
+}
+
 int32_t dmesh_doca_init(const char *dev_pci_addr,
 						  const char *rep_pci_addr,
 						  const char *server_name,

@@ -185,6 +185,8 @@ struct Inner {
 
     /// Local half shut down: further writes fail.
     tx_closed: bool,
+    /// The driver took the end of stream (see `take_fin`).
+    fin_taken: bool,
     tx_waker: Option<Waker>,
 
     /// Driver-side waker: signalled when new tx bytes (or shutdown) appear.
@@ -506,6 +508,17 @@ impl DmeshIoHandle {
         inner.wake_writer();
     }
 
+    /// True exactly once, when the stack shut down its write half and staging
+    /// fully drained: the driver then ends the stream toward the host.
+    pub fn take_fin(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fin_taken || !inner.tx_closed || inner.tx_unpublished() != 0 {
+            return false;
+        }
+        inner.fin_taken = true;
+        true
+    }
+
     /// True once the stack shut down its write half and staging fully drained.
     pub fn tx_finished(&self) -> bool {
         let inner = self.inner.lock().unwrap();
@@ -517,11 +530,11 @@ impl DmeshIoHandle {
         self.inner.lock().unwrap().rx_has_data()
     }
 
-    /// Poll-style wait for unpublished tx bytes (or shutdown); used by the
-    /// driver's tx-wake select arm.
+    /// Poll-style wait for unpublished tx bytes (or a shutdown whose end of
+    /// stream is not taken yet); used by the driver's tx-wake select arm.
     pub fn poll_tx_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.tx_unpublished() > 0 || inner.tx_closed {
+        if inner.tx_unpublished() > 0 || (inner.tx_closed && !inner.fin_taken) {
             return Poll::Ready(());
         }
         inner.driver_waker = Some(cx.waker().clone());
@@ -685,6 +698,24 @@ mod tests {
         handle.advance_publish(1);
         io.shutdown().await.unwrap();
         assert!(handle.tx_finished());
+    }
+
+    #[tokio::test]
+    async fn fin_follows_the_last_published_byte_once() {
+        let (mut io, handle) = pair();
+        let _buf = tx_staging(&handle, 16);
+        io.write_all(b"tail").await.unwrap();
+        io.shutdown().await.unwrap();
+        assert!(!handle.take_fin(), "staged bytes precede the end of stream");
+
+        let (_, len) = handle.take_staged().unwrap();
+        handle.advance_publish(len);
+        assert!(handle.take_fin());
+        assert!(!handle.take_fin());
+
+        // A taken end of stream no longer wakes the driver.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(handle.poll_tx_ready(&mut cx).is_pending());
     }
 
     #[tokio::test]
