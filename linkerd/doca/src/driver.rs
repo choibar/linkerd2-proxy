@@ -171,7 +171,7 @@ pub enum DmeshEvent {
 }
 
 /// Max connection slots per driver (mirrors DMESH_MAX_CONNECTIONS).
-pub const MAX_CONNS: usize = 32;
+pub const MAX_CONNS: usize = 64;
 
 /// Max consumer-PE events drained per loop iteration, matching the C worker's
 /// DATA_DRAIN_BUDGET: bounds each wakeup so the control path cannot starve.
@@ -261,7 +261,7 @@ impl Driver {
     /// Build the driver and its registrar. The event receiver (paired with
     /// `events`) and the `Registrar` are given to the acceptor.
     pub fn new(doca: DmeshDoca, events: mpsc::UnboundedSender<DmeshEvent>) -> (Self, Registrar) {
-        debug_assert_eq!(unsafe { dmesh_doca_max_conns() } as usize, MAX_CONNS);
+        assert_eq!(unsafe { dmesh_doca_max_conns() } as usize, MAX_CONNS, "Rust MAX_CONNS must match the C DMESH_MAX_CONNECTIONS");
         let (reg_tx, reg_rx) = mpsc::unbounded_channel();
         const NONE: Option<crate::DmeshIoHandle> = None;
         let driver = Self {
