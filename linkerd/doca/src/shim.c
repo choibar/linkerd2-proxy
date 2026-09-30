@@ -502,22 +502,30 @@ int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot,
 	conn = &objs->conns[slot];
 
 	/* Backend channels (안 2): push with this connection's doca_dma engine -
-	 * no rcv_ring, no host DPA. One <=8KB batch outstanding; the driver
-	 * retries the remainder on later ticks. */
+	 * no rcv_ring, no host DPA. Returning bytes advances Rust's publish cursor
+	 * and frees their source storage. Report them only after descriptor DMA
+	 * completion, never merely after submitting the data DMA. */
 	if (DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
 		if (!conn->reverse_exported || conn->tx_staging == NULL)
 			return -(int32_t)DOCA_ERROR_BAD_STATE;
-		while (sent < len) {
-			int r = dmesh_dma_push_staged(conn, pos + (uint32_t)sent,
-						      len - (uint32_t)sent);
-
-			if (r < 0)
-				return sent > 0 ? (int32_t)sent : (int32_t)r;
-			if (r == 0)
-				break;          /* batch in flight; retry later */
-			sent += (size_t)r;
+		if (conn->dma_closing || conn->state == DMESH_CONN_ERROR)
+			return -(int32_t)DOCA_ERROR_BAD_STATE;
+		if (conn->push_unreported_len != 0) {
+			if (pos != conn->push_unreported_pos || len < conn->push_unreported_len)
+				return -(int32_t)DOCA_ERROR_INVALID_VALUE;
+			if (conn->push_seq < conn->push_unreported_seq)
+				return 0;
+			int32_t completed = (int32_t)conn->push_unreported_len;
+			conn->push_unreported_len = 0;
+			return completed;
 		}
-		return (int32_t)sent;
+		int r = dmesh_dma_push_staged(conn, pos, len);
+		if (r <= 0)
+			return (int32_t)r;
+		conn->push_unreported_pos = pos;
+		conn->push_unreported_len = (uint32_t)r;
+		conn->push_unreported_seq = conn->push_seq + 1;
+		return 0;
 	}
 
 	if (!conn->reverse_exported || conn->tx_staging == NULL || conn->rcv_ring == NULL)
