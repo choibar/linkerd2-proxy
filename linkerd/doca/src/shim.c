@@ -404,11 +404,17 @@ int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
 
 /* Publish the reader's staging watermark to this slot's DPA thread
  * (dpa_thread_arg.rd_pos) so the kernel's staging gate can advance. Called
- * from the driver tick only when the watermark moved; one small h2d_memcpy. */
+ * from the driver tick. Batch small releases to amortize synchronous DPA
+ * copies; withheld credit stays below the staging gate's safety margin. */
+#define DMESH_RX_WM_BATCH (64u * 1024u)
+_Static_assert(DMESH_RX_WM_BATCH + 3u * 8064u < BUFFER_SIZE,
+               "watermark batching must leave room at the staging gate");
+
 int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_t pos)
 {
 	struct dmesh_conn *conn;
 	struct dmesh_doca_dpa_thread *t;
+	doca_error_t result;
 
 	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
 		return DOCA_ERROR_INVALID_VALUE;
@@ -416,8 +422,14 @@ int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_
 	t = conn->dpa_thread;
 	if (t == NULL || t->thread == NULL || t->arg == 0)
 		return DOCA_ERROR_BAD_STATE;
-	return doca_dpa_h2d_memcpy(t->dpa, t->arg + offsetof(struct dpa_thread_arg, rd_pos),
-				   &pos, sizeof(pos));
+	pos %= BUFFER_SIZE;
+	if ((pos + BUFFER_SIZE - conn->rx_wm_published) % BUFFER_SIZE < DMESH_RX_WM_BATCH)
+		return DOCA_SUCCESS;
+	result = doca_dpa_h2d_memcpy(t->dpa, t->arg + offsetof(struct dpa_thread_arg, rd_pos),
+				     &pos, sizeof(pos));
+	if (result == DOCA_SUCCESS)
+		conn->rx_wm_published = pos;
+	return result;
 }
 
 /* doca_dpa_dev_comch_producer_dma_copy (the fused copy+notify the host reverse
