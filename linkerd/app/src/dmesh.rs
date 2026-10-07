@@ -14,13 +14,15 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use dmesh_doca::{dmesh_io_pair, DmeshEvent, DmeshIo, FlowId, Registrar};
 use linkerd_app_core::{
-    identity, svc::{self, NewService, Param, ServiceExt}, tls,
+    identity,
+    svc::{self, NewService, Param, ServiceExt},
+    tls,
     transport::addrs::{AddrPair, ClientAddr, OrigDstAddr, Remote, ServerAddr},
     Conditional,
 };
 use linkerd_app_inbound::policy::{dmesh_connection_authorized, AllowPolicy};
-use dmesh_doca::{dmesh_io_pair, DmeshEvent, DmeshIo, FlowId, Registrar};
 use tokio::sync::mpsc;
 use tracing::{debug, debug_span, info, warn, Instrument};
 
@@ -121,6 +123,7 @@ pub async fn serve<N>(
     N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + 'static,
 {
     tokio::pin!(shutdown);
+    let backend_owner = dmesh_doca::backend::new_owner();
     // slot -> published backend address, so ConnClosed can unpublish it.
     let mut backend_slots: std::collections::HashMap<usize, SocketAddr> =
         std::collections::HashMap::new();
@@ -138,9 +141,15 @@ pub async fn serve<N>(
             // disconnected): evict its not-yet-taken channel from the
             // registry so the connector refuses instead of handing out a
             // dead channel. Non-backend slots have nothing registered.
-            DmeshEvent::ConnClosed(slot) | DmeshEvent::ConnError(slot) => {
+            DmeshEvent::ConnClosed(slot) => {
                 if let Some(addr) = backend_slots.remove(&slot) {
-                    dmesh_doca::backend::unpublish(slot, &addr);
+                    dmesh_doca::backend::unpublish(backend_owner, slot, &addr);
+                }
+                continue;
+            }
+            DmeshEvent::ConnError(slot) | DmeshEvent::ConnDraining(slot) => {
+                if let Some(addr) = backend_slots.get(&slot) {
+                    dmesh_doca::backend::disable(backend_owner, slot, addr);
                 }
                 continue;
             }
@@ -149,7 +158,10 @@ pub async fn serve<N>(
                 let (io, handle) = dmesh_io_pair(peer);
                 // Register the IO handle so the driver pumps recv segments into
                 // it and picks up the stack's writes.
-                if registrar.send((slot, handle)).is_err() {
+                if registrar
+                    .send((slot, flow.key, flow.location, handle))
+                    .is_err()
+                {
                     warn!("dmesh driver gone; stopping acceptor");
                     return;
                 }
@@ -162,7 +174,13 @@ pub async fn serve<N>(
                     let addr = SocketAddr::V4(flow.dst);
                     info!(slot, %addr, "dmesh backend channel ready");
                     backend_slots.insert(slot, addr);
-                    dmesh_doca::backend::publish(slot, addr, io);
+                    dmesh_doca::backend::publish_on_worker(
+                        backend_owner,
+                        slot,
+                        flow.location.worker as usize,
+                        addr,
+                        io,
+                    );
                     continue;
                 }
 
@@ -179,11 +197,9 @@ pub async fn serve<N>(
                 // for the discovered policy so the decision isn't made against
                 // the default. (Bounded so a connection is never blocked long.)
                 let mut policy = get_policy(target.param());
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    policy.changed(),
-                )
-                .await;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), policy.changed())
+                        .await;
                 let tls: tls::ConditionalServerTls = target.param();
                 let client: Remote<ClientAddr> = target.param();
                 if !dmesh_connection_authorized(&policy, client, &tls) {
@@ -211,8 +227,6 @@ pub async fn serve<N>(
                 );
             }
             DmeshEvent::InfraReady => info!("dmesh infrastructure ready"),
-            DmeshEvent::ConnClosed(slot) => debug!(slot, "dmesh connection closed"),
-            DmeshEvent::ConnError(slot) => warn!(slot, "dmesh connection setup failed"),
             DmeshEvent::Stats {
                 elapsed_ms,
                 recv_msgs,

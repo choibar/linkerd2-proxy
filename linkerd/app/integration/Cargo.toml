@@ -17,6 +17,7 @@ default = []
 flakey = []
 
 [dependencies]
+dmesh-routing = { path = "../../dmesh-routing" }
 bytes = { workspace = true }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 h2 = { workspace = true }

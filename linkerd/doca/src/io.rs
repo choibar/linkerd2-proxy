@@ -189,7 +189,7 @@ struct Inner {
     fin_taken: bool,
     tx_waker: Option<Waker>,
 
-    /// Driver-side waker: signalled when new tx bytes (or shutdown) appear.
+    /// Driver-side waker: TX, shutdown, and consumed RX credit all need progress.
     driver_waker: Option<Waker>,
 }
 
@@ -295,6 +295,7 @@ impl AsyncRead for DmeshIo {
                 // Segment fully consumed: the DPA may reuse staging up to here.
                 inner.rx_watermark = pos + len;
                 inner.rx_watermark_dirty = true;
+                inner.wake_driver();
                 if seg_cache::evict_on() {
                     // SAFETY: same completed-segment invariant as the copy above.
                     seg_cache::evict(unsafe { base.add(pos as usize) }, seg_len);
@@ -530,11 +531,13 @@ impl DmeshIoHandle {
         self.inner.lock().unwrap().rx_has_data()
     }
 
-    /// Poll-style wait for unpublished tx bytes (or a shutdown whose end of
-    /// stream is not taken yet); used by the driver's tx-wake select arm.
-    pub fn poll_tx_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+    /// Wait for TX/FIN or consumed RX credit that the driver must publish.
+    pub fn poll_driver_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.tx_unpublished() > 0 || (inner.tx_closed && !inner.fin_taken) {
+        if inner.rx_watermark_dirty
+            || inner.tx_unpublished() > 0
+            || (inner.tx_closed && !inner.fin_taken)
+        {
             return Poll::Ready(());
         }
         inner.driver_waker = Some(cx.waker().clone());
@@ -589,8 +592,11 @@ mod tests {
     #[tokio::test]
     async fn zero_copy_staging_read() {
         // Simulate a staging region: a leaked buffer the driver "DMA'd" into.
-        let staging: &'static [u8] =
-            Box::leak(b"....GET / HTTP/1.1\r\n\r\nXXXX".to_vec().into_boxed_slice());
+        let staging: &'static [u8] = Box::leak(
+            b"....GET / HTTP/1.1\r\n\r\nXXXX"
+                .to_vec()
+                .into_boxed_slice(),
+        );
         let (mut io, handle) = pair();
         handle.set_staging(staging.as_ptr() as usize, staging.len());
         // Two segments referencing offsets within the staging region.
@@ -601,6 +607,38 @@ mod tests {
         let mut out = Vec::new();
         io.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn consumed_rx_credit_wakes_idle_driver() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::task::{Wake, Waker};
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let staging = b"data";
+        let (mut io, handle) = pair();
+        handle.set_staging(staging.as_ptr() as usize, staging.len());
+        handle.push_segment(0, 4);
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(handle.poll_driver_ready(&mut cx).is_pending());
+        let mut buf = [0; 2];
+        io.read_exact(&mut buf).await.unwrap();
+        assert_eq!(count.0.load(Ordering::Relaxed), 0);
+        io.read_exact(&mut buf).await.unwrap();
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        // A consumed segment remains ready even if it preceded registration.
+        assert!(handle.poll_driver_ready(&mut cx).is_ready());
+        assert_eq!(handle.take_rx_watermark(), Some(4));
+        assert!(handle.poll_driver_ready(&mut cx).is_pending());
     }
 
     #[tokio::test]
@@ -633,7 +671,7 @@ mod tests {
         let buf = tx_staging(&handle, 64);
 
         io.write_all(b"ping").await.unwrap();
-        poll_fn(|cx| handle.poll_tx_ready(cx)).await;
+        poll_fn(|cx| handle.poll_driver_ready(cx)).await;
 
         let (pos, len) = handle.take_staged().unwrap();
         assert_eq!((pos, len), (0, 4));
@@ -715,7 +753,7 @@ mod tests {
 
         // A taken end of stream no longer wakes the driver.
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(handle.poll_tx_ready(&mut cx).is_pending());
+        assert!(handle.poll_driver_ready(&mut cx).is_pending());
     }
 
     #[tokio::test]

@@ -43,6 +43,7 @@ fn main() {
     let mut include_paths = BTreeSet::new();
     for lib in libs {
         let found = pkg_config::Config::new()
+            .cargo_metadata(false)
             .probe(lib)
             .unwrap_or_else(|error| panic!("failed to find {lib} with pkg-config: {error}"));
         include_paths.extend(found.include_paths);
@@ -94,6 +95,14 @@ fn main() {
     println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_common");
     println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_host");
     println!("cargo:rustc-link-lib=static:+whole-archive=dpa_kernel");
+    // SDK libraries must follow the archives that reference them. Emitting
+    // these first lets --as-needed discard constructor-only dependencies in
+    // standalone crate tests (DOCA logging and the dpacc registration stubs).
+    for lib in libs {
+        pkg_config::Config::new()
+            .probe(lib)
+            .unwrap_or_else(|error| panic!("failed to find {lib} with pkg-config: {error}"));
+    }
 }
 
 /// Copies a static archive, re-packing a thin archive (`!<thin>` magic; its

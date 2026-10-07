@@ -9,82 +9,16 @@ mod driver;
 mod io;
 
 pub use driver::{
-    ConnState, DmeshEvent, Driver, FlowId, Registrar, Registration, Stats, MAX_CONNS,
+    ConnState, DmeshEvent, Driver, FlowId, FlowKey, FlowLocation, Registrar, Registration, Stats,
+    MAX_CONNS,
 };
 pub use io::{dmesh_io_pair, DmeshIo, DmeshIoHandle};
 
 /// Registry of DMA backend channels: a BACKEND-mode host connection provides a
 /// service at some address, and the outbound connector takes the DmeshIo from
-/// here instead of dialing TCP. One channel per address; `take` hands the
-/// (long-lived, h2-multiplexed) connection out once.
-pub mod backend {
-    use crate::DmeshIo;
-    use std::{
-        collections::{HashMap, HashSet},
-        net::SocketAddr,
-        sync::{Mutex, OnceLock},
-    };
-
-    /// Published-but-not-yet-taken backend channels, tagged with the driver
-    /// slot that owns them so a slot teardown can evict exactly its entry.
-    fn reg() -> &'static Mutex<HashMap<SocketAddr, Vec<(usize, DmeshIo)>>> {
-        static R: OnceLock<Mutex<HashMap<SocketAddr, Vec<(usize, DmeshIo)>>>> = OnceLock::new();
-        R.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    /// Every address that has ever had a DMA backend published. A lookup
-    /// miss on one of these means the backend process went away (crashed or
-    /// exited); the connector must refuse it rather than fall through to a
-    /// TCP dial of a non-routable DMA key, which hangs until timeout and
-    /// wedges every client edge that round-robins onto that replica.
-    fn seen() -> &'static Mutex<HashSet<SocketAddr>> {
-        static S: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
-        S.get_or_init(|| Mutex::new(HashSet::new()))
-    }
-
-    /// Multiple channels may serve one address (one per DPU worker in
-    /// N-driver mode); each is handed out once, in LIFO order.
-    pub fn publish(slot: usize, addr: SocketAddr, io: DmeshIo) {
-        tracing::info!(slot, %addr, "dmesh backend channel published");
-        seen().lock().unwrap().insert(addr);
-        reg().lock().unwrap().entry(addr).or_default().push((slot, io));
-    }
-
-    /// The backend in `slot` went away (host process died / disconnected).
-    /// Drop its channel if the connector never took it, so a later `take`
-    /// cannot hand out a dead channel that would hang every request on it.
-    /// Channels already taken are owned by the h2 pool, which sees EOF from
-    /// the driver's rx/tx teardown and evicts them itself.
-    pub fn unpublish(slot: usize, addr: &SocketAddr) {
-        let mut reg = reg().lock().unwrap();
-        if let Some(v) = reg.get_mut(addr) {
-            let before = v.len();
-            v.retain(|(s, _)| *s != slot);
-            if v.len() != before {
-                tracing::warn!(slot, %addr, "dmesh backend channel unpublished (backend gone)");
-            }
-        }
-    }
-
-    /// True if a DMA backend was ever published for `addr`, even if none is
-    /// available right now.
-    pub fn was_published(addr: &SocketAddr) -> bool {
-        seen().lock().unwrap().contains(addr)
-    }
-
-    pub fn take(addr: &SocketAddr) -> Option<DmeshIo> {
-        let mut reg = reg().lock().unwrap();
-        let io = reg.get_mut(addr).and_then(|v| v.pop()).map(|(_, io)| io);
-        if io.is_some() {
-            tracing::info!(%addr, "dmesh backend channel taken by connector");
-        }
-        io
-    }
-
-    pub fn contains(addr: &SocketAddr) -> bool {
-        reg().lock().unwrap().get(addr).map(|v| !v.is_empty()).unwrap_or(false)
-    }
-}
+/// here instead of dialing TCP. One active flow per (worker, replica address);
+/// the worker-local pool shares its long-lived H2 connection across clients.
+pub mod backend;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -113,6 +47,13 @@ extern "C" {
         handle: *mut *mut c_void,
     ) -> c_int;
     fn dmesh_doca_comch_destroy(handle: *mut c_void);
+    fn dmesh_doca_group_init(
+        dev: *const c_char,
+        rep: *const c_char,
+        name: *const c_char,
+        count: u32,
+        handles: *mut *mut c_void,
+    ) -> c_int;
 }
 
 #[derive(Clone, Debug)]
@@ -180,7 +121,42 @@ pub fn initialize() -> Result<ProbeReport, Error> {
 }
 
 impl DmeshDoca {
-    pub fn initialize(dev_pci_addr: &str, rep_pci_addr: &str,server_name: &str,
+    /// One control-only dispatcher owns all Comch aliases; returned handles
+    /// contain only worker-local data resources and a control mailbox.
+    pub fn initialize_group(
+        dev: &str,
+        rep: &str,
+        name: &str,
+        count: usize,
+    ) -> Result<Vec<Self>, Error> {
+        if count == 0 || count > 128 {
+            return Err(Error::new(-1, "invalid worker count"));
+        }
+        let (dev, rep, name) = (CString::new(dev)?, CString::new(rep)?, CString::new(name)?);
+        let mut handles = vec![std::ptr::null_mut(); count];
+        let status = unsafe {
+            dmesh_doca_group_init(
+                dev.as_ptr(),
+                rep.as_ptr(),
+                name.as_ptr(),
+                count as u32,
+                handles.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::from_code(status));
+        }
+        Ok(handles
+            .into_iter()
+            .map(|p| Self {
+                handle: NonNull::new(p).expect("initialized worker"),
+            })
+            .collect())
+    }
+    pub fn initialize(
+        dev_pci_addr: &str,
+        rep_pci_addr: &str,
+        server_name: &str,
     ) -> Result<Self, Error> {
         let dev_pci_addr = CString::new(dev_pci_addr)?;
         let rep_pci_addr = CString::new(rep_pci_addr)?;
@@ -196,7 +172,10 @@ impl DmeshDoca {
             )
         };
         if status != 0 {
-            println!("Failed to initialize DOCA comch server and datapath consumer: {}", Error::from_code(status));
+            println!(
+                "Failed to initialize DOCA comch server and datapath consumer: {}",
+                Error::from_code(status)
+            );
             return Err(Error::from_code(status));
         }
 
@@ -316,6 +295,21 @@ unsafe fn c_ptr_to_string(ptr: *const c_char) -> String {
     CStr::from_ptr(ptr).to_string_lossy().into_owned()
 }
 
+/// CPUs currently allowed for this thread, in descending order. Respect taskset
+/// and offline CPUs when assigning one sharded runtime per core.
+pub fn allowed_worker_cores() -> std::io::Result<Vec<usize>> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((0..libc::CPU_SETSIZE as usize)
+            .rev()
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+            .collect())
+    }
+}
+
 /// Pin the calling OS thread to a single CPU core (sharded worker runtimes).
 /// Returns false if the affinity call failed.
 pub fn pin_current_thread_to_core(core: usize) -> bool {
@@ -324,5 +318,32 @@ pub fn pin_current_thread_to_core(core: usize) -> bool {
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(core, &mut set);
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
+}
+
+#[cfg(test)]
+mod backend_owner_tests {
+    #[test]
+    fn closing_one_worker_slot_preserves_other_workers_backend() {
+        let addr = "10.250.250.250:54321".parse().unwrap();
+        let a = super::backend::new_owner();
+        let b = super::backend::new_owner();
+        let (io_a, _ha) = super::dmesh_io_pair(addr);
+        let (io_b, _hb) = super::dmesh_io_pair(addr);
+        super::backend::publish(a, 0, addr, io_a);
+        super::backend::publish(b, 0, addr, io_b);
+        super::backend::unpublish(a, 0, &addr);
+        assert!(super::backend::take(&addr).is_some());
+        assert!(super::backend::take(&addr).is_none());
+        assert!(
+            super::backend::has_live(addr),
+            "claimed flow remains live with zero spares"
+        );
+        super::backend::unpublish(b, 0, &addr);
+        assert!(!super::backend::has_live(addr));
+        assert!(
+            super::backend::is_dma(&addr),
+            "closed DMA endpoint must not fall back to TCP"
+        );
     }
 }

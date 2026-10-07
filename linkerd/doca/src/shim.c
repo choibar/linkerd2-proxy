@@ -146,9 +146,9 @@ int32_t dmesh_doca_probe(struct dmesh_doca_probe_report *report)
 	if (report->sha_status == DOCA_SUCCESS)
 		doca_sha_destroy(sha);
 
-	report->dpa_status = doca_dpa_create(dev, &dpa);
+	report->dpa_status = DMESH_DPA_CALL(doca_dpa_create(dev, &dpa));
 	if (report->dpa_status == DOCA_SUCCESS)
-		doca_dpa_destroy(dpa);
+		DMESH_DPA_CALL(doca_dpa_destroy(dpa));
 
 	report->close_status = doca_dev_close(dev);
 	doca_devinfo_destroy_list(dev_list);
@@ -224,13 +224,10 @@ int32_t dmesh_doca_data_clear_and_drain(struct objects *objs, int fd, int budget
 	return DOCA_SUCCESS;
 }
 
-/* Progress the consumer PE up to `budget` events WITHOUT touching the
- * notification handle. Used after the first conn teardown on this worker:
- * teardown corrupts libdoca's notification bookkeeping for this PE (a later
- * doca_pe_clear_notification hits a NULL internal pointer - reproduced and
- * bisected; even with every teardown-side destroy deferred/leaked the crash
- * persists, so it is triggered by the ctx stop path itself). The driver then
- * runs this PE on its 1ms safety-net tick instead of arm/clear. */
+/* Progress without an explicit notification clear. Busy-poll needs no clear;
+ * the Rust event driver uses PROGRESS_ALL, where request_notification clears
+ * the previous notification on Linux. This also avoids the explicit-clear
+ * crash previously observed after stopping a consumer context. */
 int32_t dmesh_doca_data_drain_only(struct objects *objs, int budget, int *out_drained)
 {
 	int drained = 0;
@@ -416,8 +413,8 @@ int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_
 	t = conn->dpa_thread;
 	if (t == NULL || t->thread == NULL || t->arg == 0)
 		return DOCA_ERROR_BAD_STATE;
-	return doca_dpa_h2d_memcpy(t->dpa, t->arg + offsetof(struct dpa_thread_arg, rd_pos),
-				   &pos, sizeof(pos));
+	return DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->arg + offsetof(struct dpa_thread_arg, rd_pos),
+				   &pos, sizeof(pos)));
 }
 
 /* doca_dpa_dev_comch_producer_dma_copy (the fused copy+notify the host reverse
@@ -560,14 +557,25 @@ int32_t dmesh_doca_conn_shutdown(struct objects *objs, int32_t slot)
 	return dmesh_dma_push_fin(conn);
 }
 
+static pthread_once_t dmesh_log_once = PTHREAD_ONCE_INIT;
+static doca_error_t dmesh_log_status;
+static void dmesh_init_logging(void)
+{
+    struct doca_log_backend *sdk_log;
+    dmesh_staging_fc = 1;
+    dmesh_log_status = doca_log_backend_create_standard();
+    if (dmesh_log_status != DOCA_SUCCESS) return;
+    dmesh_log_status = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
+    if (dmesh_log_status != DOCA_SUCCESS) return;
+    dmesh_log_status = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
+}
+
 int32_t dmesh_doca_init(const char *dev_pci_addr,
 						  const char *rep_pci_addr,
 						  const char *server_name,
 						  struct objects **handle)
 {
-	dmesh_staging_fc = 1; /* we publish rd_pos (dmesh_doca_conn_rx_watermark) */
 
-	struct doca_log_backend *sdk_log;
 	struct objects *objs;
 	doca_error_t result;
 
@@ -582,28 +590,9 @@ int32_t dmesh_doca_init(const char *dev_pci_addr,
 
 	*handle = NULL;
 
-	/* register logger backends once per process (N-driver mode calls
-	 * dmesh_doca_init once per worker) */
-	static bool log_inited = false;
-	if (!log_inited) {
-		result = doca_log_backend_create_standard();
-		if (result != DOCA_SUCCESS) {
-			fprintf(stderr, "Failed to create standard log backend: %s\n", doca_error_get_name(result));
-			return result;
-		}
-		result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
-		if (result != DOCA_SUCCESS) {
-			fprintf(stderr, "Failed to create log backend for SDK: %s\n", doca_error_get_name(result));
-			return result;
-		}
-		result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
-		if (result != DOCA_SUCCESS) {
-			fprintf(stderr, "Failed to set log level for SDK log backend: %s\n", doca_error_get_name(result));
-			return result;
-		}
-		log_inited = true;
-	}
-	
+    pthread_once(&dmesh_log_once, dmesh_init_logging);
+    if (dmesh_log_status != DOCA_SUCCESS) return dmesh_log_status;
+
 	objs = calloc(1, sizeof(*objs));
 	if (objs == NULL)
 		return DOCA_ERROR_NO_MEMORY;
@@ -643,7 +632,7 @@ int32_t dmesh_doca_init(const char *dev_pci_addr,
 	return DOCA_SUCCESS;
 
 cleanup_handle:
-	cleanup_objects(objs);
+	if (cleanup_objects(objs) != DOCA_SUCCESS) return result;
 free_handle:
 	free(objs);
 	return result;
@@ -654,21 +643,87 @@ void dmesh_doca_comch_destroy(struct objects *handle)
 	if (handle == NULL)
 		return;
 
+    if (!dmesh_dispatch_worker_stop_admission(handle)) {
+        fprintf(stderr, "[DMesh] retaining worker with pending control commands\n");
+        return;
+    }
+
 	/* A dropped driver cannot prove outstanding Rust references or failed DMA
 	 * quiescence have retired. Retain the whole device domain on this void API. */
 	if (dmesh_objects_have_live_flows(handle)) {
 		fprintf(stderr, "[DMesh] retaining live flow resources after driver drop\n");
 		return;
 	}
+    if (handle->mailbox) {
+        dmesh_dispatch_worker_flush(handle);
+        for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+            if (handle->conns[i].key.session_id) return;
+    }
 	for (int i = 0; i < DMESH_MAX_SESSIONS; ++i) {
 		if (handle->sessions[i].occupied || handle->sessions[i].sends_pending) {
 			fprintf(stderr, "[DMesh] retaining control session resources after driver drop\n");
 			return;
 		}
 	}
-	/* NOTE: partial teardown. cleanup_objects only releases cc_server/pe/
-	 * rep_dev/dev; consumer/DPA/mmap/buf_arr resources are not yet freed
-	 * (a full teardown is still TODO). */
-	cleanup_objects(handle);
+	if (cleanup_objects(handle) != DOCA_SUCCESS) {
+        fprintf(stderr, "[DMesh] retaining worker after incomplete cleanup\n");
+        return;
+    }
+    dmesh_dispatch_worker_depart(handle);
 	free(handle);
 }
+
+/* Existing Comch names remain control aliases. Each data worker opens its own
+ * device reference and never owns a Comch server/control PE. */
+int32_t dmesh_doca_group_init(const char *dev, const char *rep, const char *name,
+                             uint32_t count, struct objects **out)
+{
+    if (!out || !count || count > 128) return DOCA_ERROR_INVALID_VALUE;
+    memset(out, 0, count * sizeof(*out));
+    struct objects **controls = calloc(count, sizeof(*controls));
+    if (!controls) return DOCA_ERROR_NO_MEMORY;
+    doca_error_t result = DOCA_SUCCESS;
+    for (uint32_t i = 0; i < count; ++i) {
+        char alias[64];
+        if (count == 1) snprintf(alias, sizeof(alias), "%s", name);
+        else snprintf(alias, sizeof(alias), "DPUMesh%u", i);
+        result = dmesh_doca_init(dev, rep, alias, &controls[i]);
+        if (result != DOCA_SUCCESS) goto fail;
+        out[i] = calloc(1, sizeof(*out[i]));
+        if (!out[i]) { result = DOCA_ERROR_NO_MEMORY; goto fail; }
+        out[i]->is_server = true;
+        out[i]->external_readers = true;
+        out[i]->worker_idx = (int)i;
+        result = open_doca_device_with_pci(dev, NULL, &out[i]->dev);
+        if (result != DOCA_SUCCESS) goto fail;
+    }
+    struct dmesh_dispatcher *dispatcher = NULL;
+    result = dmesh_dispatcher_start(controls, out, count, &dispatcher);
+    if (result != DOCA_SUCCESS) goto fail;
+    free(controls);
+    return DOCA_SUCCESS;
+fail:
+    for (uint32_t i = 0; i < count; ++i) {
+        dmesh_doca_comch_destroy(controls[i]);
+        dmesh_doca_comch_destroy(out[i]);
+        out[i] = NULL;
+    }
+    free(controls);
+    return result;
+}
+
+int32_t dmesh_doca_conn_identity(struct objects *o, int slot,
+                                struct dmesh_flow_key *key, struct dmesh_flow_location *location)
+{
+    if (!o || slot < 0 || slot >= DMESH_MAX_CONNECTIONS || !key || !location)
+        return DOCA_ERROR_INVALID_VALUE;
+    *key = o->conns[slot].key;
+    *location = o->conns[slot].location;
+    if (!o->mailbox) location->worker = (uint32_t)o->worker_idx;
+    return DOCA_SUCCESS;
+}
+
+/* Called only by the owning Rust Driver, enqueueing a control-plane request. */
+int dmesh_doca_worker_id(struct objects *o) { return o->worker_idx; }
+int dmesh_doca_request_backend(struct objects *o, uint32_t ip, uint16_t port)
+{ return dmesh_dispatch_backend_request(o, ip, port); }
