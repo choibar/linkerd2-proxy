@@ -174,12 +174,13 @@ struct Inner {
     /// TX staging (write-side zero-copy): the connection's mapped tx_staging
     /// region. The stack writes at `tx_write`, the driver publishes
     /// `[tx_publish, tx_write)` as DMA work. Cursors are cumulative (u64), the
-    /// physical offset is `cursor % tx_len`; unpublished bytes are never
-    /// overwritten (`room = tx_len - (tx_write - tx_publish)`).
+    /// physical offset is `cursor % tx_len`. Both unpublished and in-flight
+    /// bytes remain owned until DMA completion advances `tx_completed`.
     tx_base: usize,
     tx_len: usize,
     tx_write: u64,
     tx_publish: u64,
+    tx_completed: u64,
     /// Connection torn down: the staging pointer is no longer valid.
     tx_dead: bool,
 
@@ -333,7 +334,7 @@ impl AsyncWrite for DmeshIo {
             return Poll::Pending;
         }
 
-        let room = inner.tx_len as u64 - inner.tx_unpublished();
+        let room = inner.tx_len as u64 - (inner.tx_write - inner.tx_completed);
         if room == 0 {
             inner.tx_waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -346,7 +347,7 @@ impl AsyncWrite for DmeshIo {
         let base = inner.tx_base as *mut u8;
         // SAFETY: [off, off+first) and (on wrap) [0, n-first) lie inside the
         // mapped tx_staging region of `tx_len` bytes; the room check above
-        // guarantees these bytes are not part of the unpublished window, and
+        // guarantees these bytes are neither unpublished nor in-flight, and
         // the mutex serializes all access. The region stays alive until
         // `clear_tx_staging` sets `tx_dead` (checked above under this lock).
         unsafe {
@@ -437,6 +438,8 @@ impl DmeshIoHandle {
         }
     }
 
+    /// Deliver a completed recv segment `[pos, pos+len)` in the staging region
+    /// to the reading stack (zero-copy: no bytes are moved here).
     pub fn push_segment(&self, pos: u32, len: u32) {
         let mut inner = self.inner.lock().unwrap();
         if inner.staging_base != 0 {
@@ -497,8 +500,7 @@ impl DmeshIoHandle {
         Some((off as u32, run as u32))
     }
 
-    /// Mark `n` staged bytes as published (queued for / covered by DMA); frees
-    /// writer room.
+    /// Mark bytes submitted to DMA. Submission does not free writer room.
     pub fn advance_publish(&self, n: u32) {
         if n == 0 {
             return;
@@ -506,14 +508,36 @@ impl DmeshIoHandle {
         let mut inner = self.inner.lock().unwrap();
         debug_assert!(n as u64 <= inner.tx_unpublished());
         inner.tx_publish += n as u64;
-        inner.wake_writer();
+    }
+
+    /// Complete the contiguous successful prefix of this flow's DMA copies.
+    /// An old handle cannot reclaim a new flow's storage after detach.
+    pub fn advance_completed(&self, end: u64) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.tx_dead {
+            return Ok(());
+        }
+        if end < inner.tx_completed || end > inner.tx_publish {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid DMA completion cursor",
+            ));
+        }
+        if end != inner.tx_completed {
+            inner.tx_completed = end;
+            inner.wake_writer();
+            if inner.tx_closed {
+                inner.wake_driver();
+            }
+        }
+        Ok(())
     }
 
     /// True exactly once, when the stack shut down its write half and staging
-    /// fully drained: the driver then ends the stream toward the host.
+    /// DMA-completed: the driver then ends the stream toward the host.
     pub fn take_fin(&self) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if inner.fin_taken || !inner.tx_closed || inner.tx_unpublished() != 0 {
+        if inner.fin_taken || !inner.tx_closed || inner.tx_completed != inner.tx_write {
             return false;
         }
         inner.fin_taken = true;
@@ -523,7 +547,7 @@ impl DmeshIoHandle {
     /// True once the stack shut down its write half and staging fully drained.
     pub fn tx_finished(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.tx_closed && inner.tx_unpublished() == 0
+        inner.tx_closed && inner.tx_completed == inner.tx_write
     }
 
     /// True while the reader still has undelivered/undrained data.
@@ -536,7 +560,7 @@ impl DmeshIoHandle {
         let mut inner = self.inner.lock().unwrap();
         if inner.rx_watermark_dirty
             || inner.tx_unpublished() > 0
-            || (inner.tx_closed && !inner.fin_taken)
+            || (inner.tx_closed && !inner.fin_taken && inner.tx_completed == inner.tx_write)
         {
             return Poll::Ready(());
         }
@@ -697,6 +721,7 @@ mod tests {
         let (pos, len) = handle.take_staged().unwrap();
         assert_eq!((pos, len), (0, 6));
         handle.advance_publish(6);
+        handle.advance_completed(6).unwrap();
 
         // 6 more bytes: 2 fit before the end, 4 wrap to the front.
         io.write_all(b"ghijkl").await.unwrap();
@@ -713,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backpressure_until_publish_frees_room() {
+    async fn backpressure_until_completion_frees_room() {
         let (mut io, handle) = pair();
         let _buf = tx_staging(&handle, 8);
 
@@ -727,19 +752,26 @@ mod tests {
         assert!(!blocked.is_finished(), "full staging must backpressure");
 
         let (_, len) = handle.take_staged().unwrap();
-        handle.advance_publish(len); // frees the whole region
+        handle.advance_publish(len);
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "submission cannot release DMA source"
+        );
+        handle.advance_completed(len as u64).unwrap();
 
         let mut io = (&mut blocked).await.unwrap();
         let (pos, len) = handle.take_staged().unwrap();
         assert_eq!((pos, len), (0, 1)); // wrapped to the front
 
         handle.advance_publish(1);
+        handle.advance_completed(9).unwrap();
         io.shutdown().await.unwrap();
         assert!(handle.tx_finished());
     }
 
     #[tokio::test]
-    async fn fin_follows_the_last_published_byte_once() {
+    async fn fin_follows_the_last_completed_byte_once() {
         let (mut io, handle) = pair();
         let _buf = tx_staging(&handle, 16);
         io.write_all(b"tail").await.unwrap();
@@ -748,12 +780,61 @@ mod tests {
 
         let (_, len) = handle.take_staged().unwrap();
         handle.advance_publish(len);
+        assert!(!handle.take_fin());
+        assert!(!handle.tx_finished());
+        handle.advance_completed(len as u64).unwrap();
         assert!(handle.take_fin());
         assert!(!handle.take_fin());
 
         // A taken end of stream no longer wakes the driver.
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(handle.poll_driver_ready(&mut cx).is_pending());
+    }
+
+    #[tokio::test]
+    async fn partial_completion_preserves_inflight_bytes_across_wrap() {
+        let (mut io, handle) = pair();
+        let buf = tx_staging(&handle, 8);
+        io.write_all(b"abcdefgh").await.unwrap();
+        handle.advance_publish(8);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"BAD").is_pending());
+        assert_eq!(buf, b"abcdefgh");
+        handle.advance_completed(3).unwrap();
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"12345"),
+            Poll::Ready(Ok(3))
+        ));
+        assert_eq!(buf, b"123defgh");
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"x").is_pending());
+        assert!(handle.advance_completed(2).is_err());
+        assert!(handle.advance_completed(9).is_err());
+        handle.advance_completed(3).unwrap(); // duplicate does not release twice
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"x").is_pending());
+        handle.advance_completed(8).unwrap();
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"45678"),
+            Poll::Ready(Ok(5))
+        ));
+        assert_eq!(buf, b"12345678");
+    }
+
+    #[tokio::test]
+    async fn stale_completion_after_detach_cannot_touch_replacement() {
+        let (mut old, old_handle) = pair();
+        let buf = tx_staging(&old_handle, 8);
+        old.write_all(b"old-data").await.unwrap();
+        old_handle.advance_publish(8);
+        old_handle.clear_tx_staging();
+        let (mut new, new_handle) = pair();
+        new_handle.set_tx_staging(buf.as_ptr() as usize, 8);
+        new.write_all(b"new-data").await.unwrap();
+        new_handle.advance_publish(8);
+        old_handle.advance_completed(8).unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut new).poll_write(&mut cx, b"x").is_pending());
+        assert_eq!(buf, b"new-data");
+        assert!(old.write_all(b"x").await.is_err());
     }
 
     #[tokio::test]

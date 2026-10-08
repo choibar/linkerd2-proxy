@@ -462,12 +462,21 @@ int32_t dmesh_doca_conn_tx_staging(struct objects *objs, int32_t slot,
 	    out_base == NULL || out_len == NULL)
 		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
 	conn = &objs->conns[slot];
-	if (!conn->reverse_exported || conn->tx_staging == NULL || conn->tx_staging_len <= 64)
+	if (conn->state != DMESH_CONN_RUNNING || conn->dma_closing ||
+	    !conn->reverse_exported || conn->tx_staging == NULL || conn->tx_staging_len <= 64)
 		return -(int32_t)DOCA_ERROR_BAD_STATE;   /* reverse path not ready yet */
 
 	*out_base = (uintptr_t)conn->tx_staging;
 	*out_len = conn->tx_staging_len - 64;
 	return 0;
+}
+
+/* Worker-owned query: completion is independent of application RX release. */
+int32_t dmesh_doca_conn_tx_completed(struct objects *objs, int32_t slot, uint64_t *bytes)
+{
+    if (!objs || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
+        return DOCA_ERROR_INVALID_VALUE;
+    return dmesh_dma_tx_completed(&objs->conns[slot], bytes);
 }
 
 /* Publish response bytes the Rust side already wrote into tx_staging at
@@ -540,7 +549,7 @@ int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot,
 	return (int32_t)sent;
 }
 
-/* The stack shut down its write half and every staged byte was accepted. On a
+/* The stack shut down its write half and every staged byte completed DMA. On a
  * push flow the host reads end of stream after the last batch; the flow stays
  * open for the host's bytes until the host closes it. Other flows return
  * DOCA_ERROR_NOT_SUPPORTED and are unchanged. */

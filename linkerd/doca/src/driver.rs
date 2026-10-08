@@ -97,6 +97,7 @@ extern "C" {
     // Publish response bytes already staged at [pos, pos+len) (no memcpy).
     // Returns bytes accepted (>=0, may be < len) or a negative doca_error_t.
     fn dmesh_doca_conn_send_staged(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> i32;
+    fn dmesh_doca_conn_tx_completed(objs: *mut c_void, slot: i32, bytes: *mut u64) -> i32;
     fn dmesh_doca_conn_shutdown(objs: *mut c_void, slot: i32) -> i32;
 }
 
@@ -372,6 +373,32 @@ impl Driver {
         }
     }
 
+    fn pump_tx_completions(&mut self) -> Result<(), Error> {
+        for slot in 0..MAX_CONNS {
+            if !self.tx_set[slot] {
+                continue;
+            }
+            let Some(handle) = self.handles[slot].as_ref() else {
+                continue;
+            };
+            let mut bytes = 0;
+            let rc =
+                unsafe { dmesh_doca_conn_tx_completed(self.doca.raw(), slot as i32, &mut bytes) };
+            if rc != 0 {
+                // C has failed/closed this flow. Do not turn a failed DMA into
+                // a successful source release; fenced teardown owns cleanup.
+                handle.clear_tx_staging();
+                handle.clear_rx_staging();
+                self.tx_set[slot] = false;
+                continue;
+            }
+            handle
+                .advance_completed(bytes)
+                .map_err(|e| Error::new(-1, format!("slot {slot}: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Publish response bytes the stack staged (write-side zero-copy: the bytes
     /// are already in tx_staging) back to the host over the reverse DMA path.
     /// Each contiguous unpublished run is handed to the C side, which emits DMA
@@ -414,7 +441,7 @@ impl Driver {
                 }
                 // fully accepted; loop to drain the wrapped remainder if any
             }
-            // End of stream follows the last accepted byte. Flows that cannot
+            // End of stream follows the last DMA-completed byte. Flows that cannot
             // carry it (NOT_SUPPORTED) close through the host as before.
             if handle.take_fin() {
                 let _ = unsafe { dmesh_doca_conn_shutdown(self.doca.raw(), slot as i32) };
@@ -646,6 +673,7 @@ impl Driver {
                 self.request_backend(addr);
             }
             self.pump_recv();
+            self.pump_tx_completions()?;
             self.pump_send();
             // Staging flow control: tell each slot's DPA thread how far the
             // reader got, so it can reuse the staging ring behind it.
