@@ -569,7 +569,6 @@ static doca_error_t dmesh_log_status;
 static void dmesh_init_logging(void)
 {
     struct doca_log_backend *sdk_log;
-    dmesh_staging_fc = 1;
     dmesh_log_status = doca_log_backend_create_standard();
     if (dmesh_log_status != DOCA_SUCCESS) return;
     dmesh_log_status = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
