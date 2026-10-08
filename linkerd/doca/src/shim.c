@@ -383,10 +383,8 @@ int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
 	return DOCA_SUCCESS;
 }
 
-/* Release a segment after the reader consumed its bytes. TODO(flow-control):
- * this is where a staging-buffer read watermark would be published back to the
- * DPA to gate reuse; today the staging ring has no producer backpressure, so
- * this only advances an accounting counter. */
+/* Legacy no-op release hook. RX staging space is returned through
+ * dmesh_doca_conn_update_dpu_rx_consumed_pos after full segment consumption. */
 int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
 				     uint32_t pos, uint32_t len)
 {
@@ -400,9 +398,9 @@ int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
 }
 
 /* Update the DPU RX consumed position in this slot's DPA thread
- * (dpa_thread_ctx.rd_pos in TLS) so the kernel's staging gate can advance. Called
+ * (dpa_thread_ctx.rx_consumed_pos in TLS) so the kernel's staging gate can advance. Called
  * from the driver tick only after full segment consumption; one small h2d_memcpy. */
-int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_t pos)
+int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t slot, uint32_t pos)
 {
 	struct dmesh_conn *conn;
 	struct dmesh_doca_dpa_thread *t;
@@ -413,7 +411,7 @@ int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_
 	t = conn->dpa_thread;
 	if (t == NULL || t->thread == NULL || t->local_storage == 0)
 		return DOCA_ERROR_BAD_STATE;
-	return DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rd_pos),
+	return DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
 				   &pos, sizeof(pos)));
 }
 

@@ -161,10 +161,10 @@ struct Inner {
     staging_base: usize,
     staging_len: usize,
     segs: VecDeque<(u32, u32)>,
-    /// Staging offset up to which every segment has been consumed (published
-    /// to the DPA as its reuse gate), and whether it moved since last publish.
-    rx_watermark: u32,
-    rx_watermark_dirty: bool,
+    /// End offset of the last fully consumed DPU RX staging segment.
+    dpu_rx_consumed_pos: u32,
+    /// A segment was fully consumed since the last get_dpu_rx_consumed_pos call.
+    dpu_rx_consumed_pos_changed: bool,
     seg_read_off: usize, // partial-consume cursor into segs.front()
 
     /// Peer half closed: reads drain rx/segs then return EOF.
@@ -294,8 +294,8 @@ impl AsyncRead for DmeshIo {
                 inner.segs.pop_front();
                 inner.seg_read_off = 0;
                 // Segment fully consumed: the DPA may reuse staging up to here.
-                inner.rx_watermark = pos + len;
-                inner.rx_watermark_dirty = true;
+                inner.dpu_rx_consumed_pos = pos + len;
+                inner.dpu_rx_consumed_pos_changed = true;
                 inner.wake_driver();
                 if seg_cache::evict_on() {
                     // SAFETY: same completed-segment invariant as the copy above.
@@ -425,14 +425,14 @@ impl DmeshIoHandle {
         inner.wake_driver();
     }
 
-    /// Deliver a completed recv segment `[pos, pos+len)` in the staging region
-    /// to the reading stack (zero-copy: no bytes are moved here).
-    /// Take the consumed-staging watermark if it moved since the last take.
-    pub fn take_rx_watermark(&self) -> Option<u32> {
+    /// Get the latest DPU RX consumed position if a segment was fully consumed
+    /// since the last call, clearing the changed flag. This does not confirm
+    /// that the position has been delivered to the DPA.
+    pub fn get_dpu_rx_consumed_pos(&self) -> Option<u32> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.rx_watermark_dirty {
-            inner.rx_watermark_dirty = false;
-            Some(inner.rx_watermark)
+        if inner.dpu_rx_consumed_pos_changed {
+            inner.dpu_rx_consumed_pos_changed = false;
+            Some(inner.dpu_rx_consumed_pos)
         } else {
             None
         }
@@ -558,7 +558,7 @@ impl DmeshIoHandle {
     /// Wait for TX/FIN or consumed RX credit that the driver must publish.
     pub fn poll_driver_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.rx_watermark_dirty
+        if inner.dpu_rx_consumed_pos_changed
             || inner.tx_unpublished() > 0
             || (inner.tx_closed && !inner.fin_taken && inner.tx_completed == inner.tx_write)
         {
@@ -661,7 +661,7 @@ mod tests {
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
         // A consumed segment remains ready even if it preceded registration.
         assert!(handle.poll_driver_ready(&mut cx).is_ready());
-        assert_eq!(handle.take_rx_watermark(), Some(4));
+        assert_eq!(handle.get_dpu_rx_consumed_pos(), Some(4));
         assert!(handle.poll_driver_ready(&mut cx).is_pending());
     }
 

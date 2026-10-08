@@ -69,9 +69,8 @@ extern "C" {
         out_pos: *mut u32,
         out_len: *mut u32,
     ) -> c_int;
-    // Used once staging-buffer flow control lands (read watermark -> DPA).
-    #[allow(dead_code)]
-    fn dmesh_doca_conn_rx_watermark(objs: *mut c_void, slot: i32, pos: u32) -> i32;
+    // Update the DPA's consumed position to return DPU RX staging space.
+    fn dmesh_doca_conn_update_dpu_rx_consumed_pos(objs: *mut c_void, slot: i32, pos: u32) -> i32;
     fn dmesh_doca_conn_recv_release(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> c_int;
     // Flow mode of a slot: 0 = client, 1 = backend provider.
     fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
@@ -679,8 +678,14 @@ impl Driver {
             // reader got, so it can reuse the staging ring behind it.
             for slot in 0..MAX_CONNS {
                 if let Some(h) = self.handles[slot].as_ref() {
-                    if let Some(p) = h.take_rx_watermark() {
-                        unsafe { dmesh_doca_conn_rx_watermark(self.doca.raw(), slot as i32, p) };
+                    if let Some(pos) = h.get_dpu_rx_consumed_pos() {
+                        unsafe {
+                            dmesh_doca_conn_update_dpu_rx_consumed_pos(
+                                self.doca.raw(),
+                                slot as i32,
+                                pos,
+                            )
+                        };
                     }
                 }
             }
