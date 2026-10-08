@@ -19,6 +19,7 @@ members = [
     "linkerd/conditional",
     "linkerd/distribute",
     "linkerd/doca",
+    "linkerd/dmesh-routing",
     "linkerd/dns/name",
     "linkerd/dns",
     "linkerd/duplex",

@@ -65,7 +65,13 @@ fn main() {
     // Stage 1 (synchronous, pre-runtime): open the DOCA device and start the
     // dmesh comch server. The async driver is spawned inside the runtime below.
     #[cfg(feature = "doca")]
+    let worker_cores = dmesh_doca::allowed_worker_cores().expect("read worker CPU affinity");
+    #[cfg(feature = "doca")]
     let dmesh_doca = {
+        if let Err(error) = dmesh_doca::backend::init_routes() {
+            eprintln!("Invalid DMA routes: {error}");
+            std::process::exit(EX_USAGE);
+        }
         match dmesh_doca::initialize() {
             Ok(report) => info!("{}", report.log_summary()),
             Err(error) => {
@@ -76,50 +82,42 @@ fn main() {
         let dev_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_DEV_PCI_ADDR") {
             Ok(addr) => addr,
             Err(error) => {
-                eprintln!(
-                    "Invalid DOCA configuration: LINKERD2_PROXY_DOCA_DEV_PCI_ADDR: {error}"
-                );
+                eprintln!("Invalid DOCA configuration: LINKERD2_PROXY_DOCA_DEV_PCI_ADDR: {error}");
                 std::process::exit(EX_USAGE);
             }
         };
         let rep_pci_addr = match std::env::var("LINKERD2_PROXY_DOCA_REP_PCI_ADDR") {
             Ok(addr) => addr,
             Err(error) => {
-                eprintln!(
-                    "Invalid DOCA configuration: LINKERD2_PROXY_DOCA_REP_PCI_ADDR: {error}"
-                );
+                eprintln!("Invalid DOCA configuration: LINKERD2_PROXY_DOCA_REP_PCI_ADDR: {error}");
                 std::process::exit(EX_USAGE);
             }
         };
         let server_name = std::env::var("LINKERD2_PROXY_DOCA_SERVER_NAME")
             .unwrap_or_else(|_| "DPUMesh0".to_string());
-        // DMESH_NUM_WORKERS=W starts W shared-nothing comch servers
-        // ("DPUMesh0".."DPUMesh<W-1>"), each with its own DPA pool and driver —
-        // the Rust mirror of `dpumesh -t W` (dpu_worker.c).
+        // Comch aliases are control endpoints, not worker placement hints.
+        // A single dispatcher assigns each native flow to a data worker.
         let num_workers: usize = std::env::var("DMESH_NUM_WORKERS")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(1);
-        (0..num_workers)
-            .map(|i| {
-                let name = if num_workers == 1 {
-                    server_name.clone()
-                } else {
-                    format!("DPUMesh{i}")
-                };
-                match dmesh_doca::DmeshDoca::initialize(&dev_pci_addr, &rep_pci_addr, &name) {
-                    Ok(doca_handle) => {
-                        info!(server = %name, "dmesh comch server started");
-                        doca_handle
-                    }
-                    Err(error) => {
-                        eprintln!("DOCA comch initialization failure ({name}): {error}");
-                        std::process::exit(1);
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
+        if std::env::var_os("DMESH_SHARDED").is_some() && num_workers > worker_cores.len() {
+            eprintln!("DMESH_NUM_WORKERS exceeds CPUs allowed by process affinity");
+            std::process::exit(EX_USAGE);
+        }
+        match dmesh_doca::DmeshDoca::initialize_group(
+            &dev_pci_addr,
+            &rep_pci_addr,
+            &server_name,
+            num_workers,
+        ) {
+            Ok(workers) => workers,
+            Err(error) => {
+                eprintln!("DOCA dispatcher initialization failure: {error}");
+                std::process::exit(1);
+            }
+        }
     };
 
     let mut metrics = linkerd_metrics::prom::Registry::default();
@@ -160,13 +158,14 @@ fn main() {
             if dmesh_sharded {
                 dmesh_shards.push((i, driver, dmesh_rx, registrar));
             } else {
+                dmesh_doca::backend::register_worker(i);
                 tokio::spawn(async move {
                     match driver.run().await {
                         Ok(()) => warn!(worker = i, "dmesh driver exited"),
                         Err(error) => warn!(worker = i, %error, "dmesh driver failed"),
                     }
                 });
-                dmesh_acceptors.push((dmesh_rx, registrar));
+                dmesh_acceptors.push((i, dmesh_rx, registrar));
             }
         }
 
@@ -195,17 +194,16 @@ fn main() {
 
         // Drive DMA-received connections through the outbound stack.
         #[cfg(feature = "doca")]
-        for (dmesh_rx, registrar) in dmesh_acceptors {
-            app.spawn_dmesh(dmesh_rx, registrar);
+        for (i, dmesh_rx, registrar) in dmesh_acceptors {
+            app.spawn_dmesh(i, dmesh_rx, registrar);
         }
 
         // Sharded mode: one pinned thread + current_thread runtime per worker.
-        // Worker i pins to core 15-i (the harness tasksets the process to the
-        // top-N cores, so shards land inside that mask).
+        // Select distinct online CPUs inside the launch affinity, highest first.
         #[cfg(feature = "doca")]
         for (i, driver, dmesh_rx, registrar) in dmesh_shards {
-            let serve = app.dmesh_serve_future(dmesh_rx, registrar);
-            let core = 15usize.saturating_sub(i);
+            let serve = app.dmesh_serve_future(i, dmesh_rx, registrar);
+            let core = worker_cores[i];
             std::thread::Builder::new()
                 .name(format!("dmesh-shard-{i}"))
                 .spawn(move || {
@@ -217,7 +215,11 @@ fn main() {
                         .build()
                         .expect("dmesh shard runtime");
                     rt.block_on(async move {
-                        info!(worker = i, core, "dmesh shard running (pinned current_thread runtime)");
+                        dmesh_doca::backend::register_worker(i);
+                        info!(
+                            worker = i,
+                            core, "dmesh shard running (pinned current_thread runtime)"
+                        );
                         tokio::spawn(async move {
                             match driver.run().await {
                                 Ok(()) => warn!(worker = i, "dmesh driver exited"),

@@ -85,7 +85,7 @@ pub struct App {
     start_proxy: Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
     tap: tap::Tap,
     #[cfg(feature = "doca")]
-    dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo>,
+    dmesh_outbound: std::sync::Arc<dyn Fn() -> svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> + Send + Sync>,
     #[cfg(feature = "doca")]
     dmesh_policies: dmesh::DmeshGetPolicy,
     #[cfg(feature = "doca")]
@@ -278,13 +278,13 @@ impl Config {
         // Second outbound instantiation over I = DmeshIo, fed by the DMA path.
         // `mk` consumes `self`, so clone the (cloneable) Outbound and policies.
         #[cfg(feature = "doca")]
-        let dmesh_outbound: svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> = outbound
-            .clone()
-            .mk(
-                dst.profiles.clone(),
-                outbound_policies.clone(),
-                dst.resolve.clone(),
-            );
+        let dmesh_outbound: std::sync::Arc<dyn Fn() -> svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> + Send + Sync> = {
+            let out=outbound.clone();
+            let profiles=dst.profiles.clone(); let policies=outbound_policies.clone(); let resolve=dst.resolve.clone();
+            // Pools/connectors capture this stack's logical worker. Sharing
+            // stacks would merge workers again even on a multi-thread runtime.
+            std::sync::Arc::new(move || out.clone().mk(profiles.clone(),policies.clone(),resolve.clone()))
+        };
         let outbound = outbound.mk(dst.profiles.clone(), outbound_policies, dst.resolve.clone());
 
         // Inbound authorization lookup for the fused dmesh authz gate: a closure
@@ -399,10 +399,11 @@ impl App {
     #[cfg(feature = "doca")]
     pub fn spawn_dmesh(
         &self,
+        worker: usize,
         events: mpsc::UnboundedReceiver<dmesh_doca::DmeshEvent>,
         registrar: dmesh_doca::Registrar,
     ) {
-        tokio::spawn(self.dmesh_serve_future(events, registrar));
+        tokio::spawn(self.dmesh_serve_future(worker, events, registrar));
     }
 
     /// The dmesh acceptor as a bare future, so a sharded deployment can run it
@@ -411,14 +412,18 @@ impl App {
     #[cfg(feature = "doca")]
     pub fn dmesh_serve_future(
         &self,
+        worker: usize,
         events: mpsc::UnboundedReceiver<dmesh_doca::DmeshEvent>,
         registrar: dmesh_doca::Registrar,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let outbound = self.dmesh_outbound.clone();
         let get_policy = self.dmesh_policies.clone();
         let shutdown = self.dmesh_drain.clone().signaled();
-        dmesh::serve(events, registrar, outbound, get_policy, shutdown)
-            .instrument(info_span!("dmesh").or_current())
+        dmesh_doca::backend::on_worker(worker, async move {
+            // Factory runs after entering the shard runtime; caches are local.
+            let outbound=outbound();
+            dmesh::serve(events,registrar,outbound,get_policy,shutdown).await;
+        }).instrument(info_span!("dmesh").or_current())
     }
 
     pub fn inbound_addr(&self) -> Local<ServerAddr> {

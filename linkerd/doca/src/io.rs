@@ -161,10 +161,10 @@ struct Inner {
     staging_base: usize,
     staging_len: usize,
     segs: VecDeque<(u32, u32)>,
-    /// Staging offset up to which every segment has been consumed (published
-    /// to the DPA as its reuse gate), and whether it moved since last publish.
-    rx_watermark: u32,
-    rx_watermark_dirty: bool,
+    /// End offset of the last fully consumed DPU RX staging segment.
+    dpu_rx_consumed_pos: u32,
+    /// A segment was fully consumed since the last get_dpu_rx_consumed_pos call.
+    dpu_rx_consumed_pos_changed: bool,
     seg_read_off: usize, // partial-consume cursor into segs.front()
 
     /// Peer half closed: reads drain rx/segs then return EOF.
@@ -174,12 +174,13 @@ struct Inner {
     /// TX staging (write-side zero-copy): the connection's mapped tx_staging
     /// region. The stack writes at `tx_write`, the driver publishes
     /// `[tx_publish, tx_write)` as DMA work. Cursors are cumulative (u64), the
-    /// physical offset is `cursor % tx_len`; unpublished bytes are never
-    /// overwritten (`room = tx_len - (tx_write - tx_publish)`).
+    /// physical offset is `cursor % tx_len`. Both unpublished and in-flight
+    /// bytes remain owned until DMA completion advances `tx_completed`.
     tx_base: usize,
     tx_len: usize,
     tx_write: u64,
     tx_publish: u64,
+    tx_completed: u64,
     /// Connection torn down: the staging pointer is no longer valid.
     tx_dead: bool,
 
@@ -189,7 +190,7 @@ struct Inner {
     fin_taken: bool,
     tx_waker: Option<Waker>,
 
-    /// Driver-side waker: signalled when new tx bytes (or shutdown) appear.
+    /// Driver-side waker: TX, shutdown, and consumed RX credit all need progress.
     driver_waker: Option<Waker>,
 }
 
@@ -293,8 +294,9 @@ impl AsyncRead for DmeshIo {
                 inner.segs.pop_front();
                 inner.seg_read_off = 0;
                 // Segment fully consumed: the DPA may reuse staging up to here.
-                inner.rx_watermark = pos + len;
-                inner.rx_watermark_dirty = true;
+                inner.dpu_rx_consumed_pos = pos + len;
+                inner.dpu_rx_consumed_pos_changed = true;
+                inner.wake_driver();
                 if seg_cache::evict_on() {
                     // SAFETY: same completed-segment invariant as the copy above.
                     seg_cache::evict(unsafe { base.add(pos as usize) }, seg_len);
@@ -332,7 +334,7 @@ impl AsyncWrite for DmeshIo {
             return Poll::Pending;
         }
 
-        let room = inner.tx_len as u64 - inner.tx_unpublished();
+        let room = inner.tx_len as u64 - (inner.tx_write - inner.tx_completed);
         if room == 0 {
             inner.tx_waker = Some(cx.waker().clone());
             return Poll::Pending;
@@ -345,7 +347,7 @@ impl AsyncWrite for DmeshIo {
         let base = inner.tx_base as *mut u8;
         // SAFETY: [off, off+first) and (on wrap) [0, n-first) lie inside the
         // mapped tx_staging region of `tx_len` bytes; the room check above
-        // guarantees these bytes are not part of the unpublished window, and
+        // guarantees these bytes are neither unpublished nor in-flight, and
         // the mutex serializes all access. The region stays alive until
         // `clear_tx_staging` sets `tx_dead` (checked above under this lock).
         unsafe {
@@ -423,19 +425,21 @@ impl DmeshIoHandle {
         inner.wake_driver();
     }
 
-    /// Deliver a completed recv segment `[pos, pos+len)` in the staging region
-    /// to the reading stack (zero-copy: no bytes are moved here).
-    /// Take the consumed-staging watermark if it moved since the last take.
-    pub fn take_rx_watermark(&self) -> Option<u32> {
+    /// Get the latest DPU RX consumed position if a segment was fully consumed
+    /// since the last call, clearing the changed flag. This does not confirm
+    /// that the position has been delivered to the DPA.
+    pub fn get_dpu_rx_consumed_pos(&self) -> Option<u32> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.rx_watermark_dirty {
-            inner.rx_watermark_dirty = false;
-            Some(inner.rx_watermark)
+        if inner.dpu_rx_consumed_pos_changed {
+            inner.dpu_rx_consumed_pos_changed = false;
+            Some(inner.dpu_rx_consumed_pos)
         } else {
             None
         }
     }
 
+    /// Deliver a completed recv segment `[pos, pos+len)` in the staging region
+    /// to the reading stack (zero-copy: no bytes are moved here).
     pub fn push_segment(&self, pos: u32, len: u32) {
         let mut inner = self.inner.lock().unwrap();
         if inner.staging_base != 0 {
@@ -496,8 +500,7 @@ impl DmeshIoHandle {
         Some((off as u32, run as u32))
     }
 
-    /// Mark `n` staged bytes as published (queued for / covered by DMA); frees
-    /// writer room.
+    /// Mark bytes submitted to DMA. Submission does not free writer room.
     pub fn advance_publish(&self, n: u32) {
         if n == 0 {
             return;
@@ -505,14 +508,36 @@ impl DmeshIoHandle {
         let mut inner = self.inner.lock().unwrap();
         debug_assert!(n as u64 <= inner.tx_unpublished());
         inner.tx_publish += n as u64;
-        inner.wake_writer();
+    }
+
+    /// Complete the contiguous successful prefix of this flow's DMA copies.
+    /// An old handle cannot reclaim a new flow's storage after detach.
+    pub fn advance_completed(&self, end: u64) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.tx_dead {
+            return Ok(());
+        }
+        if end < inner.tx_completed || end > inner.tx_publish {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid DMA completion cursor",
+            ));
+        }
+        if end != inner.tx_completed {
+            inner.tx_completed = end;
+            inner.wake_writer();
+            if inner.tx_closed {
+                inner.wake_driver();
+            }
+        }
+        Ok(())
     }
 
     /// True exactly once, when the stack shut down its write half and staging
-    /// fully drained: the driver then ends the stream toward the host.
+    /// DMA-completed: the driver then ends the stream toward the host.
     pub fn take_fin(&self) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if inner.fin_taken || !inner.tx_closed || inner.tx_unpublished() != 0 {
+        if inner.fin_taken || !inner.tx_closed || inner.tx_completed != inner.tx_write {
             return false;
         }
         inner.fin_taken = true;
@@ -522,7 +547,7 @@ impl DmeshIoHandle {
     /// True once the stack shut down its write half and staging fully drained.
     pub fn tx_finished(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.tx_closed && inner.tx_unpublished() == 0
+        inner.tx_closed && inner.tx_completed == inner.tx_write
     }
 
     /// True while the reader still has undelivered/undrained data.
@@ -530,11 +555,13 @@ impl DmeshIoHandle {
         self.inner.lock().unwrap().rx_has_data()
     }
 
-    /// Poll-style wait for unpublished tx bytes (or a shutdown whose end of
-    /// stream is not taken yet); used by the driver's tx-wake select arm.
-    pub fn poll_tx_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+    /// Wait for TX/FIN or consumed RX credit that the driver must publish.
+    pub fn poll_driver_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.tx_unpublished() > 0 || (inner.tx_closed && !inner.fin_taken) {
+        if inner.dpu_rx_consumed_pos_changed
+            || inner.tx_unpublished() > 0
+            || (inner.tx_closed && !inner.fin_taken && inner.tx_completed == inner.tx_write)
+        {
             return Poll::Ready(());
         }
         inner.driver_waker = Some(cx.waker().clone());
@@ -589,8 +616,11 @@ mod tests {
     #[tokio::test]
     async fn zero_copy_staging_read() {
         // Simulate a staging region: a leaked buffer the driver "DMA'd" into.
-        let staging: &'static [u8] =
-            Box::leak(b"....GET / HTTP/1.1\r\n\r\nXXXX".to_vec().into_boxed_slice());
+        let staging: &'static [u8] = Box::leak(
+            b"....GET / HTTP/1.1\r\n\r\nXXXX"
+                .to_vec()
+                .into_boxed_slice(),
+        );
         let (mut io, handle) = pair();
         handle.set_staging(staging.as_ptr() as usize, staging.len());
         // Two segments referencing offsets within the staging region.
@@ -601,6 +631,38 @@ mod tests {
         let mut out = Vec::new();
         io.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"GET / HTTP/1.1\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn consumed_rx_credit_wakes_idle_driver() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::task::{Wake, Waker};
+        struct Count(AtomicUsize);
+        impl Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let staging = b"data";
+        let (mut io, handle) = pair();
+        handle.set_staging(staging.as_ptr() as usize, staging.len());
+        handle.push_segment(0, 4);
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(handle.poll_driver_ready(&mut cx).is_pending());
+        let mut buf = [0; 2];
+        io.read_exact(&mut buf).await.unwrap();
+        assert_eq!(count.0.load(Ordering::Relaxed), 0);
+        io.read_exact(&mut buf).await.unwrap();
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        // A consumed segment remains ready even if it preceded registration.
+        assert!(handle.poll_driver_ready(&mut cx).is_ready());
+        assert_eq!(handle.get_dpu_rx_consumed_pos(), Some(4));
+        assert!(handle.poll_driver_ready(&mut cx).is_pending());
     }
 
     #[tokio::test]
@@ -633,7 +695,7 @@ mod tests {
         let buf = tx_staging(&handle, 64);
 
         io.write_all(b"ping").await.unwrap();
-        poll_fn(|cx| handle.poll_tx_ready(cx)).await;
+        poll_fn(|cx| handle.poll_driver_ready(cx)).await;
 
         let (pos, len) = handle.take_staged().unwrap();
         assert_eq!((pos, len), (0, 4));
@@ -659,6 +721,7 @@ mod tests {
         let (pos, len) = handle.take_staged().unwrap();
         assert_eq!((pos, len), (0, 6));
         handle.advance_publish(6);
+        handle.advance_completed(6).unwrap();
 
         // 6 more bytes: 2 fit before the end, 4 wrap to the front.
         io.write_all(b"ghijkl").await.unwrap();
@@ -675,7 +738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backpressure_until_publish_frees_room() {
+    async fn backpressure_until_completion_frees_room() {
         let (mut io, handle) = pair();
         let _buf = tx_staging(&handle, 8);
 
@@ -689,19 +752,26 @@ mod tests {
         assert!(!blocked.is_finished(), "full staging must backpressure");
 
         let (_, len) = handle.take_staged().unwrap();
-        handle.advance_publish(len); // frees the whole region
+        handle.advance_publish(len);
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "submission cannot release DMA source"
+        );
+        handle.advance_completed(len as u64).unwrap();
 
         let mut io = (&mut blocked).await.unwrap();
         let (pos, len) = handle.take_staged().unwrap();
         assert_eq!((pos, len), (0, 1)); // wrapped to the front
 
         handle.advance_publish(1);
+        handle.advance_completed(9).unwrap();
         io.shutdown().await.unwrap();
         assert!(handle.tx_finished());
     }
 
     #[tokio::test]
-    async fn fin_follows_the_last_published_byte_once() {
+    async fn fin_follows_the_last_completed_byte_once() {
         let (mut io, handle) = pair();
         let _buf = tx_staging(&handle, 16);
         io.write_all(b"tail").await.unwrap();
@@ -710,12 +780,61 @@ mod tests {
 
         let (_, len) = handle.take_staged().unwrap();
         handle.advance_publish(len);
+        assert!(!handle.take_fin());
+        assert!(!handle.tx_finished());
+        handle.advance_completed(len as u64).unwrap();
         assert!(handle.take_fin());
         assert!(!handle.take_fin());
 
         // A taken end of stream no longer wakes the driver.
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(handle.poll_tx_ready(&mut cx).is_pending());
+        assert!(handle.poll_driver_ready(&mut cx).is_pending());
+    }
+
+    #[tokio::test]
+    async fn partial_completion_preserves_inflight_bytes_across_wrap() {
+        let (mut io, handle) = pair();
+        let buf = tx_staging(&handle, 8);
+        io.write_all(b"abcdefgh").await.unwrap();
+        handle.advance_publish(8);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"BAD").is_pending());
+        assert_eq!(buf, b"abcdefgh");
+        handle.advance_completed(3).unwrap();
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"12345"),
+            Poll::Ready(Ok(3))
+        ));
+        assert_eq!(buf, b"123defgh");
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"x").is_pending());
+        assert!(handle.advance_completed(2).is_err());
+        assert!(handle.advance_completed(9).is_err());
+        handle.advance_completed(3).unwrap(); // duplicate does not release twice
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"x").is_pending());
+        handle.advance_completed(8).unwrap();
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"45678"),
+            Poll::Ready(Ok(5))
+        ));
+        assert_eq!(buf, b"12345678");
+    }
+
+    #[tokio::test]
+    async fn stale_completion_after_detach_cannot_touch_replacement() {
+        let (mut old, old_handle) = pair();
+        let buf = tx_staging(&old_handle, 8);
+        old.write_all(b"old-data").await.unwrap();
+        old_handle.advance_publish(8);
+        old_handle.clear_tx_staging();
+        let (mut new, new_handle) = pair();
+        new_handle.set_tx_staging(buf.as_ptr() as usize, 8);
+        new.write_all(b"new-data").await.unwrap();
+        new_handle.advance_publish(8);
+        old_handle.advance_completed(8).unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut new).poll_write(&mut cx, b"x").is_pending());
+        assert_eq!(buf, b"new-data");
+        assert!(old.write_all(b"x").await.is_err());
     }
 
     #[tokio::test]

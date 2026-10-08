@@ -1,10 +1,10 @@
 use futures::{stream, StreamExt as _};
-use linkerd_app_integration::policy;
 use linkerd2_proxy_api::{
     destination,
     inbound::{self, inbound_server_policies_server},
     outbound::{self, outbound_policies_server},
 };
+use linkerd_app_integration::policy;
 use std::{net::SocketAddr, pin::Pin};
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -20,6 +20,7 @@ type OutboundStream =
 struct Policy {
     inbound: inbound::Server,
     backend: SocketAddr,
+    routes: Option<tokio::sync::watch::Receiver<std::sync::Arc<dmesh_routing::Manifest>>>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -39,19 +40,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             policy::all_authenticated(id.clone()),
             format!("all-authenticated (require id={id})"),
         ),
-        _ => (policy::all_unauthenticated(), "all-unauthenticated".to_string()),
+        _ => (
+            policy::all_unauthenticated(),
+            "all-unauthenticated".to_string(),
+        ),
     };
 
-    let svc = Policy { inbound, backend };
+    let routes = dmesh_routing::from_env().map_err(std::io::Error::other)?;
+    let svc = Policy {
+        inbound,
+        backend,
+        routes,
+    };
 
     eprintln!("mock policy serving on {addr}");
     eprintln!("inbound policy: {inbound_desc}");
     eprintln!("outbound policy: forward to {backend}");
 
     Server::builder()
-        .add_service(inbound_server_policies_server::InboundServerPoliciesServer::new(
-            svc.clone(),
-        ))
+        .add_service(inbound_server_policies_server::InboundServerPoliciesServer::new(svc.clone()))
         .add_service(outbound_policies_server::OutboundPoliciesServer::new(svc))
         .serve(addr)
         .await?;
@@ -99,6 +106,19 @@ impl outbound_policies_server::OutboundPolicies for Policy {
         req: Request<outbound::TrafficSpec>,
     ) -> Result<Response<outbound::OutboundPolicy>, Status> {
         let req = req.into_inner();
+        if let Some(routes) = &self.routes {
+            let manifest = routes.borrow();
+            let addr = target_addr(&req)
+                .ok_or_else(|| Status::invalid_argument("DMA routing requires an address"))?;
+            let p = if let Some(s) = manifest.by_vip(addr) {
+                policy::outbound_default(&s.discovery)
+            } else if manifest.endpoint(addr).is_some() {
+                forward_policy(addr)
+            } else {
+                return Err(Status::not_found("unknown DMA service/endpoint"));
+            };
+            return Ok(Response::new(p));
+        }
         let backend = target_backend(&req).unwrap_or(self.backend);
         eprintln!("outbound get target={:?} backend={}", req.target, backend);
         Ok(Response::new(forward_policy(backend)))
@@ -109,6 +129,20 @@ impl outbound_policies_server::OutboundPolicies for Policy {
         req: Request<outbound::TrafficSpec>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let req = req.into_inner();
+        if let Some(routes) = &self.routes {
+            let manifest = routes.borrow();
+            let addr = target_addr(&req)
+                .ok_or_else(|| Status::invalid_argument("DMA routing requires an address"))?;
+            let p = if let Some(s) = manifest.by_vip(addr) {
+                policy::outbound_default(&s.discovery)
+            } else if manifest.endpoint(addr).is_some() {
+                forward_policy(addr)
+            } else {
+                return Err(Status::not_found("unknown DMA service/endpoint"));
+            };
+            let stream = stream::once(async move { Ok(p) }).chain(stream::pending());
+            return Ok(Response::new(Box::pin(stream)));
+        }
         let backend = target_backend(&req).unwrap_or(self.backend);
         eprintln!("outbound watch target={:?} backend={}", req.target, backend);
         let policy = forward_policy(backend);
@@ -124,6 +158,10 @@ fn target_backend(req: &outbound::TrafficSpec) -> Option<SocketAddr> {
     if std::env::var("MOCK_POLICY_ECHO_TARGET").is_err() {
         return None;
     }
+    target_addr(req)
+}
+
+fn target_addr(req: &outbound::TrafficSpec) -> Option<SocketAddr> {
     use linkerd2_proxy_api::net::ip_address::Ip;
     match req.target.as_ref()? {
         outbound::traffic_spec::Target::Addr(a) => {
@@ -185,8 +223,7 @@ fn forward_policy(addr: SocketAddr) -> outbound::OutboundPolicy {
 fn replace_http_route_backends(route: &mut outbound::HttpRoute, addr: SocketAddr) {
     for rule in &mut route.rules {
         let Some(outbound::http_route::Distribution {
-            kind:
-                Some(outbound::http_route::distribution::Kind::FirstAvailable(first_available)),
+            kind: Some(outbound::http_route::distribution::Kind::FirstAvailable(first_available)),
         }) = rule.backends.as_mut()
         else {
             continue;
@@ -203,8 +240,7 @@ fn replace_http_route_backends(route: &mut outbound::HttpRoute, addr: SocketAddr
 fn replace_opaque_route_backends(route: &mut outbound::OpaqueRoute, addr: SocketAddr) {
     for rule in &mut route.rules {
         let Some(outbound::opaque_route::Distribution {
-            kind:
-                Some(outbound::opaque_route::distribution::Kind::FirstAvailable(first_available)),
+            kind: Some(outbound::opaque_route::distribution::Kind::FirstAvailable(first_available)),
         }) = rule.backends.as_mut()
         else {
             continue;
@@ -249,14 +285,19 @@ fn replace_backend(backend: &mut outbound::Backend, addr: SocketAddr) {
         None => (None, None),
     };
 
-    backend.kind = Some(outbound::backend::Kind::Forward(destination::WeightedAddr {
-        addr: Some(addr.try_into().expect("socket addr must convert to protobuf")),
-        weight: 1,
-        metric_labels: Default::default(),
-        protocol_hint,
-        tls_identity,
-        authority_override: None,
-        http2: None,
-        resource_ref: None,
-    }));
+    backend.kind = Some(outbound::backend::Kind::Forward(
+        destination::WeightedAddr {
+            addr: Some(
+                addr.try_into()
+                    .expect("socket addr must convert to protobuf"),
+            ),
+            weight: 1,
+            metric_labels: Default::default(),
+            protocol_hint,
+            tls_identity,
+            authority_override: None,
+            http2: None,
+            resource_ref: None,
+        },
+    ));
 }

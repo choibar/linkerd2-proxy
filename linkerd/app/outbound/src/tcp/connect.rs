@@ -17,14 +17,12 @@ pub struct Connect {
 #[derive(Clone, Debug)]
 pub struct PreventLoopback<S>(S);
 
-/// Physical connector that reaches DMA-provided backends through their
-/// registered dmesh channel and everything else via TCP. A backend host
-/// process (DMESH_BACKEND_CONNECT) publishes one long-lived DmeshIo per
-/// service address into `dmesh_doca::backend`; the h2 client caches the one
-/// connection it gets, which matches the one-channel-per-service model.
+/// Physical connector for the logical worker captured at stack construction.
+/// Its H2 pool requests a worker-local backend on first use; this connector
+/// takes that flow once. Other destinations keep the ordinary TCP path.
 #[cfg(feature = "doca")]
 #[derive(Clone, Debug)]
-pub struct DmeshOrTcp(PreventLoopback<ConnectTcp>);
+pub struct DmeshOrTcp(PreventLoopback<ConnectTcp>, usize);
 
 // === impl Outbound ===
 
@@ -45,7 +43,7 @@ impl Outbound<()> {
         let connect = DmeshOrTcp(PreventLoopback(ConnectTcp::new(
             self.config.proxy.connect.keepalive,
             self.config.proxy.connect.user_timeout,
-        )));
+        )), dmesh_doca::backend::current_worker());
         self.clone().with_stack(connect)
     }
 }
@@ -72,7 +70,7 @@ where
 
     fn call(&mut self, ep: T) -> Self::Future {
         let Remote(ServerAddr(addr)) = ep.param();
-        if let Some(dio) = dmesh_doca::backend::take(&addr) {
+        if let Some(dio) = dmesh_doca::backend::take_on_worker(self.1, &addr) {
             tracing::info!(server.addr = %addr, "Connecting via dmesh DMA backend channel");
             let local = Local(ClientAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
             return Box::pin(future::ready(Ok((io::EitherIo::Right(dio), local))));
@@ -82,7 +80,7 @@ where
         // backend gives - so the caller's gRPC fails the RPC fast and its
         // round-robin moves to a live replica. Falling through would TCP-dial
         // the non-routable DMA key and hang until timeout, wedging the edge.
-        if dmesh_doca::backend::was_published(&addr) {
+        if dmesh_doca::backend::is_dma(&addr) {
             tracing::warn!(server.addr = %addr, "dmesh DMA backend gone; refusing instead of TCP fallback");
             return Box::pin(future::ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,

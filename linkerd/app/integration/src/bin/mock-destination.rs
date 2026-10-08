@@ -16,6 +16,7 @@ type GetProfileStream = Pin<
 #[derive(Clone, Debug)]
 struct Destination {
     backend: SocketAddr,
+    routes: Option<tokio::sync::watch::Receiver<std::sync::Arc<dmesh_routing::Manifest>>>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Server::builder()
         .add_service(destination_server::DestinationServer::new(Destination {
             backend,
+            routes: dmesh_routing::from_env().map_err(std::io::Error::other)?,
         }))
         .serve(addr)
         .await?;
@@ -50,6 +52,66 @@ impl destination_server::Destination for Destination {
         req: Request<destination::GetDestination>,
     ) -> Result<Response<Self::GetStream>, Status> {
         let req = req.into_inner();
+        if let Some(routes) = &self.routes {
+            if routes.borrow().by_path(&req.path).is_none() {
+                return Err(Status::not_found("unknown DMA service"));
+            }
+            let mut previous = std::collections::BTreeSet::<SocketAddr>::new();
+            let stream =
+                tokio_stream::wrappers::WatchStream::new(routes.clone()).flat_map(move |m| {
+                    let next: std::collections::BTreeSet<_> = m
+                        .by_path(&req.path)
+                        .into_iter()
+                        .flat_map(|s| &s.endpoints)
+                        .filter(|e| e.enabled)
+                        .map(|e| e.dma)
+                        .collect();
+                    let removed: Vec<_> = previous
+                        .difference(&next)
+                        .map(|a| (*a).try_into().unwrap())
+                        .collect();
+                    let added: Vec<_> = next
+                        .difference(&previous)
+                        .map(|a| destination::WeightedAddr {
+                            addr: Some((*a).try_into().unwrap()),
+                            weight: 1,
+                            protocol_hint: Some(destination::ProtocolHint {
+                                protocol: Some(destination::protocol_hint::Protocol::H2(
+                                    destination::protocol_hint::H2 {},
+                                )),
+                                opaque_transport: None,
+                            }),
+                            ..Default::default()
+                        })
+                        .collect();
+                    let mut updates = Vec::new();
+                    if !removed.is_empty() {
+                        updates.push(destination::update::Update::Remove(destination::AddrSet {
+                            addrs: removed,
+                        }));
+                    }
+                    if !added.is_empty() {
+                        updates.push(destination::update::Update::Add(
+                            destination::WeightedAddrSet {
+                                addrs: added,
+                                metric_labels: Default::default(),
+                            },
+                        ));
+                    }
+                    if next.is_empty() {
+                        updates.push(destination::update::Update::NoEndpoints(
+                            destination::NoEndpoints { exists: true },
+                        ));
+                    }
+                    previous = next;
+                    stream::iter(
+                        updates
+                            .into_iter()
+                            .map(|u| Ok(destination::Update { update: Some(u) })),
+                    )
+                });
+            return Ok(Response::new(Box::pin(stream)));
+        }
         eprintln!("destination get path={} backend={}", req.path, self.backend);
 
         let update = destination::Update {

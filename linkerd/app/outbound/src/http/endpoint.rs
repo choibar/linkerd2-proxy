@@ -90,14 +90,17 @@ impl<T> Outbound<svc::ArcNewHttp<T, http::BoxBody>> {
             // Initiates an HTTP client on the underlying transport. Prior-knowledge HTTP/2
             // is typically used (i.e. when communicating with other proxies); though
             // HTTP/1.x fallback is supported as needed.
-            inner
+            let inner = inner
                 // Drive the connection to completion regardless of whether the reconnect is being
                 // actively polled.
                 .push_on_service(svc::layer::mk(svc::SpawnReady::new))
                 .push_new_reconnect(backoff)
                 .push(svc::NewMapErr::layer_from_target::<EndpointError, _>())
                 .push_on_service(svc::MapErr::layer_boxed())
-                .arc_new_http()
+                .arc_new_http();
+            #[cfg(feature = "doca")]
+            let inner = inner.push(svc::layer::mk(super::dmesh_pool::NewPool::new)).arc_new_http();
+            inner
                 // Tear down server connections when a peer proxy generates a
                 // response with the `l5d-proxy-connection: close` header. This
                 // is only done when the `Closable` parameter is set to true.

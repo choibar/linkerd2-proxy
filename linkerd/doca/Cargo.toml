@@ -8,6 +8,7 @@ publish = { workspace = true }
 description = "Small DOCA initialization wrapper for linkerd2-proxy"
 
 [dependencies]
+dmesh-routing = { path = "../dmesh-routing" }
 libc = "0.2"
 tracing = { workspace = true }
 async-trait = "0.1"

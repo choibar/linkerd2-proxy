@@ -19,20 +19,21 @@ use tokio::sync::mpsc;
 use crate::{DmeshDoca, Error};
 
 extern "C" {
+    fn dmesh_doca_worker_id(objs: *mut c_void) -> c_int;
+    fn dmesh_doca_request_backend(objs: *mut c_void, ip: u32, port: u16) -> c_int;
+    fn dmesh_doca_conn_identity(
+        objs: *mut c_void,
+        slot: i32,
+        key: *mut FlowKey,
+        location: *mut FlowLocation,
+    ) -> c_int;
     fn dmesh_doca_ctrl_get_fd(objs: *mut c_void, out_fd: *mut c_int) -> c_int;
     fn dmesh_doca_ctrl_arm(objs: *mut c_void) -> c_int;
     fn dmesh_doca_ctrl_drain(objs: *mut c_void) -> c_int;
-    fn dmesh_doca_ctrl_clear_and_drain(objs: *mut c_void, fd: c_int) -> c_int;
     fn dmesh_doca_ctrl_advance(objs: *mut c_void, out_state: *mut c_int) -> c_int;
 
     fn dmesh_doca_data_get_fd(objs: *mut c_void, out_fd: *mut c_int) -> c_int;
     fn dmesh_doca_data_arm(objs: *mut c_void) -> c_int;
-    fn dmesh_doca_data_clear_and_drain(
-        objs: *mut c_void,
-        fd: c_int,
-        budget: c_int,
-        out_drained: *mut c_int,
-    ) -> c_int;
 
     fn dmesh_doca_max_conns() -> c_int;
     fn dmesh_doca_conn_state_get(objs: *mut c_void, slot: i32) -> i32;
@@ -68,15 +69,9 @@ extern "C" {
         out_pos: *mut u32,
         out_len: *mut u32,
     ) -> c_int;
-    // Used once staging-buffer flow control lands (read watermark -> DPA).
-    #[allow(dead_code)]
-    fn dmesh_doca_conn_rx_watermark(objs: *mut c_void, slot: i32, pos: u32) -> i32;
-    fn dmesh_doca_conn_recv_release(
-        objs: *mut c_void,
-        slot: i32,
-        pos: u32,
-        len: u32,
-    ) -> c_int;
+    // Update the DPA's consumed position to return DPU RX staging space.
+    fn dmesh_doca_conn_update_dpu_rx_consumed_pos(objs: *mut c_void, slot: i32, pos: u32) -> i32;
+    fn dmesh_doca_conn_recv_release(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> c_int;
     // Flow mode of a slot: 0 = client, 1 = backend provider.
     fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
     // Report the connection's mapped tx_staging region (usable base + len) so
@@ -86,7 +81,11 @@ extern "C" {
     // IO handles were marked via clear_tx_staging/clear_rx_staging.
     fn dmesh_doca_reap_graves(objs: *mut c_void);
 
-    fn dmesh_doca_data_drain_only(objs: *mut c_void, budget: c_int, out_drained: *mut c_int) -> c_int;
+    fn dmesh_doca_data_drain_only(
+        objs: *mut c_void,
+        budget: c_int,
+        out_drained: *mut c_int,
+    ) -> c_int;
 
     fn dmesh_doca_conn_tx_staging(
         objs: *mut c_void,
@@ -97,6 +96,7 @@ extern "C" {
     // Publish response bytes already staged at [pos, pos+len) (no memcpy).
     // Returns bytes accepted (>=0, may be < len) or a negative doca_error_t.
     fn dmesh_doca_conn_send_staged(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> i32;
+    fn dmesh_doca_conn_tx_completed(objs: *mut c_void, slot: i32, bytes: *mut u64) -> i32;
     fn dmesh_doca_conn_shutdown(objs: *mut c_void, slot: i32) -> i32;
 }
 
@@ -137,6 +137,8 @@ impl ConnState {
 /// in for the peer address a TCP accept would have provided.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowId {
+    pub key: FlowKey,
+    pub location: FlowLocation,
     pub src: std::net::SocketAddrV4,
     pub dst: std::net::SocketAddrV4,
     /// Source workload identity (pod / service-account) for policy & telemetry.
@@ -144,6 +146,22 @@ pub struct FlowId {
     /// True for a BACKEND-mode connection: the host end provides the service
     /// at `dst`; the connector reaches it through this channel instead of TCP.
     pub is_backend: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlowKey {
+    pub session_id: u64,
+    pub session_epoch: u64,
+    pub flow_id: u32,
+    pub generation: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlowLocation {
+    pub ownership_epoch: u64,
+    pub worker: u32,
+    pub slot: u32,
 }
 
 /// Events emitted by the driver as the shared state machine progresses.
@@ -156,6 +174,7 @@ pub enum DmeshEvent {
     ConnReady(usize, FlowId),
     /// The connection in this slot was unbound (host disconnected).
     ConnClosed(usize),
+    ConnDraining(usize),
     /// Setup of the connection in this slot failed; the slot is parked.
     ConnError(usize),
     /// Periodic datapath report (deltas over `elapsed_ms`, emitted only when
@@ -205,7 +224,7 @@ pub struct Stats {
 /// task that owns the `Driver`.
 /// Registration message from the acceptor: bind a per-connection IO handle to
 /// a slot so the driver can pump recv segments into it and pick up its writes.
-pub type Registration = (usize, crate::DmeshIoHandle);
+pub type Registration = (usize, FlowKey, FlowLocation, crate::DmeshIoHandle);
 /// Sender the acceptor uses to register connection handles with the driver.
 pub type Registrar = mpsc::UnboundedSender<Registration>;
 
@@ -215,10 +234,6 @@ pub struct Driver {
     reg_rx: mpsc::UnboundedReceiver<Registration>,
     conn_states: [ConnState; MAX_CONNS],
     handles: [Option<crate::DmeshIoHandle>; MAX_CONNS],
-    // Set once any connection on this worker has been torn down: from then on
-    // the consumer PE is driven by the 1ms tick (drain-only), never by
-    // arm/clear_notification - teardown corrupts that path inside libdoca.
-    saw_teardown: bool,
 
     // Whether a slot's tx_staging region has been reported to its handle yet.
     // The reverse path becomes ready a tick or two after registration, so this
@@ -270,7 +285,6 @@ impl Driver {
             reg_rx,
             conn_states: [ConnState::Free; MAX_CONNS],
             handles: [NONE; MAX_CONNS],
-            saw_teardown: false,
             tx_set: [false; MAX_CONNS],
             t_in: None,
             dpu_sum_us: 0,
@@ -281,30 +295,35 @@ impl Driver {
 
     /// Install any pending IO handles, wiring each to its slot's staging region.
     fn drain_registrations(&mut self) {
-        while let Ok((slot, handle)) = self.reg_rx.try_recv() {
-            if slot >= MAX_CONNS
-                || ConnState::from_raw(unsafe {
-                    dmesh_doca_conn_state_get(self.doca.raw(), slot as i32)
-                }) != ConnState::Running
-            {
-                // A delayed registration must not resurrect a closing flow.
-                handle.clear_tx_staging();
-                handle.clear_rx_staging();
-                continue;
-            }
-            // The replaced IO may still be used on another runtime thread.
-            let _ = detach_readers(&mut self.handles[slot], || Ok(()));
-            let mut base: *const u8 = std::ptr::null();
-            let mut len: usize = 0;
-            let rc = unsafe {
-                dmesh_doca_conn_staging_base(self.doca.raw(), slot as i32, &mut base, &mut len)
-            };
-            if rc == 0 && !base.is_null() {
-                handle.set_staging(base as usize, len);
-            }
-            self.tx_set[slot] = false;
-            self.handles[slot] = Some(handle);
+        while let Ok(registration) = self.reg_rx.try_recv() {
+            self.install_registration(registration);
         }
+    }
+
+    fn install_registration(&mut self, (slot, key, location, handle): Registration) {
+        if slot >= MAX_CONNS
+            || ConnState::from_raw(unsafe {
+                dmesh_doca_conn_state_get(self.doca.raw(), slot as i32)
+            }) != ConnState::Running
+            || self.identity(slot) != (key, location)
+        {
+            // A delayed registration must not resurrect a closing flow.
+            handle.clear_tx_staging();
+            handle.clear_rx_staging();
+            return;
+        }
+        // The replaced IO may still be used on another runtime thread.
+        let _ = detach_readers(&mut self.handles[slot], || Ok(()));
+        let mut base: *const u8 = std::ptr::null();
+        let mut len: usize = 0;
+        let rc = unsafe {
+            dmesh_doca_conn_staging_base(self.doca.raw(), slot as i32, &mut base, &mut len)
+        };
+        if rc == 0 && !base.is_null() {
+            handle.set_staging(base as usize, len);
+        }
+        self.tx_set[slot] = false;
+        self.handles[slot] = Some(handle);
     }
 
     /// Report each slot's tx_staging region to its handle once the reverse path
@@ -320,8 +339,9 @@ impl Driver {
             };
             let mut base: usize = 0;
             let mut len: usize = 0;
-            let rc =
-                unsafe { dmesh_doca_conn_tx_staging(self.doca.raw(), slot as i32, &mut base, &mut len) };
+            let rc = unsafe {
+                dmesh_doca_conn_tx_staging(self.doca.raw(), slot as i32, &mut base, &mut len)
+            };
             if rc == 0 && base != 0 && len > 0 {
                 handle.set_tx_staging(base, len);
                 self.tx_set[slot] = true;
@@ -350,6 +370,32 @@ impl Driver {
                 handle.push_segment(pos, len);
             }
         }
+    }
+
+    fn pump_tx_completions(&mut self) -> Result<(), Error> {
+        for slot in 0..MAX_CONNS {
+            if !self.tx_set[slot] {
+                continue;
+            }
+            let Some(handle) = self.handles[slot].as_ref() else {
+                continue;
+            };
+            let mut bytes = 0;
+            let rc =
+                unsafe { dmesh_doca_conn_tx_completed(self.doca.raw(), slot as i32, &mut bytes) };
+            if rc != 0 {
+                // C has failed/closed this flow. Do not turn a failed DMA into
+                // a successful source release; fenced teardown owns cleanup.
+                handle.clear_tx_staging();
+                handle.clear_rx_staging();
+                self.tx_set[slot] = false;
+                continue;
+            }
+            handle
+                .advance_completed(bytes)
+                .map_err(|e| Error::new(-1, format!("slot {slot}: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Publish response bytes the stack staged (write-side zero-copy: the bytes
@@ -394,7 +440,7 @@ impl Driver {
                 }
                 // fully accepted; loop to drain the wrapped remainder if any
             }
-            // End of stream follows the last accepted byte. Flows that cannot
+            // End of stream follows the last DMA-completed byte. Flows that cannot
             // carry it (NOT_SUPPORTED) close through the host as before.
             if handle.take_fin() {
                 let _ = unsafe { dmesh_doca_conn_shutdown(self.doca.raw(), slot as i32) };
@@ -463,14 +509,23 @@ impl Driver {
         // inet_addr() stores the address bytes in network order in memory;
         // both PCIe endpoints are little-endian, so the raw u32's LE bytes
         // are exactly the network-order octets.
-        let is_backend =
-            unsafe { dmesh_doca_conn_mode_get(self.doca.raw(), slot as i32) } == 1;
+        let is_backend = unsafe { dmesh_doca_conn_mode_get(self.doca.raw(), slot as i32) } == 1;
         FlowId {
+            key: self.identity(slot).0,
+            location: self.identity(slot).1,
             src: std::net::SocketAddrV4::new(src_ip.to_le_bytes().into(), src_port),
             dst: std::net::SocketAddrV4::new(dst_ip.to_le_bytes().into(), dst_port),
             workload,
             is_backend,
         }
+    }
+
+    fn identity(&self, slot: usize) -> (FlowKey, FlowLocation) {
+        let (mut key, mut location) = (FlowKey::default(), FlowLocation::default());
+        unsafe {
+            dmesh_doca_conn_identity(self.doca.raw(), slot as i32, &mut key, &mut location);
+        }
+        (key, location)
     }
 
     fn advance(&mut self) -> Result<c_int, Error> {
@@ -484,7 +539,6 @@ impl Driver {
                 continue;
             }
             self.tx_set[slot] = false;
-            self.saw_teardown = true;
             detach_readers(&mut self.handles[slot], || {
                 check(unsafe { dmesh_doca_conn_readers_detached(raw, slot as i32) })
             })?;
@@ -513,6 +567,7 @@ impl Driver {
             let ev = match cur {
                 ConnState::Running => Some(DmeshEvent::ConnReady(slot, self.conn_flow(slot))),
                 ConnState::Error => Some(DmeshEvent::ConnError(slot)),
+                ConnState::Closing => Some(DmeshEvent::ConnDraining(slot)),
                 ConnState::Free if prev != ConnState::Free => Some(DmeshEvent::ConnClosed(slot)),
                 _ => None, // New / ConsumerStarting / AwaitMetadata are internal setup states
             };
@@ -526,7 +581,6 @@ impl Driver {
                     handle.clear_rx_staging();
                 }
                 self.tx_set[slot] = false;
-                self.saw_teardown = true;
             }
 
             if let Some(ev) = ev {
@@ -539,7 +593,21 @@ impl Driver {
     /// Run the driver until an unrecoverable error. Mirrors the C event loop:
     /// arm both PEs -> drain control -> bounded data drain -> advance ->
     /// emit events -> sleep on either fd unless the data budget was exhausted.
+    fn request_backend(&mut self, addr: std::net::SocketAddr) {
+        if let std::net::SocketAddr::V4(addr) = addr {
+            // Same representation as inet_pton's network-order bytes in C.
+            let ip = u32::from_ne_bytes(addr.ip().octets());
+            let code = unsafe { dmesh_doca_request_backend(self.doca.raw(), ip, addr.port()) };
+            if code != 0 {
+                tracing::debug!(code, %addr, "backend admission deferred");
+            }
+        }
+    }
+
     pub async fn run(mut self) -> Result<(), Error> {
+        let worker = unsafe { dmesh_doca_worker_id(self.doca.raw()) } as usize;
+        let (request_tx, mut request_rx) = mpsc::channel(32);
+        crate::backend::register_requester(worker, request_tx);
         // Build the shared infrastructure (DPA pool, consumer PE, ...) before
         // serving connections; this also makes the consumer PE fd available.
         let state = self.advance()?;
@@ -577,39 +645,20 @@ impl Driver {
         }
 
         loop {
-            // Arm first so events pending now (or arriving during the drains
-            // below) signal the fds; the eager drain+advance closes the race
-            // where a setup step already consumed the awaited event. Both PEs
-            // run in PROGRESS_ALL mode, so arming clears prior notifications.
-            // Busy-poll never waits on the fds, so arming (and its per-iteration
-            // syscall/doorbell cost) is skipped entirely.
+            // Both PEs use PROGRESS_ALL. On Linux request_notification clears
+            // the old notification itself; explicit clear_notification is
+            // unnecessary and was unsafe after a consumer context stopped.
+            // Arm before the eager drain so arrivals between draining and
+            // waiting cannot be missed. A full data budget keeps us runnable.
             if !busy_poll {
                 check(unsafe { dmesh_doca_ctrl_arm(self.doca.raw()) })?;
-                // After the first teardown the data PE's notification state is
-                // poisoned inside libdoca (clear_notification hits a NULL
-                // internal pointer); stop arming it - the 1ms safety-net tick
-                // below keeps the datapath live via drain-only polling.
-                if !self.saw_teardown {
-                    check(unsafe { dmesh_doca_data_arm(self.doca.raw()) })?;
-                }
+                check(unsafe { dmesh_doca_data_arm(self.doca.raw()) })?;
             }
-
             check(unsafe { dmesh_doca_ctrl_drain(self.doca.raw()) })?;
             let mut drained: c_int = 0;
-            if self.saw_teardown {
-                check(unsafe {
-                    dmesh_doca_data_drain_only(self.doca.raw(), DATA_DRAIN_BUDGET, &mut drained)
-                })?;
-            } else {
-                check(unsafe {
-                    dmesh_doca_data_clear_and_drain(
-                        self.doca.raw(),
-                        data_fd,
-                        DATA_DRAIN_BUDGET,
-                        &mut drained,
-                    )
-                })?;
-            }
+            check(unsafe {
+                dmesh_doca_data_drain_only(self.doca.raw(), DATA_DRAIN_BUDGET, &mut drained)
+            })?;
 
             self.advance()?;
             self.emit_conn_events();
@@ -619,14 +668,24 @@ impl Driver {
             // Install any handles the acceptor registered, then deliver the
             // recv segments the drain above produced to the reading stacks.
             self.drain_registrations();
+            while let Ok(addr) = request_rx.try_recv() {
+                self.request_backend(addr);
+            }
             self.pump_recv();
+            self.pump_tx_completions()?;
             self.pump_send();
             // Staging flow control: tell each slot's DPA thread how far the
             // reader got, so it can reuse the staging ring behind it.
             for slot in 0..MAX_CONNS {
                 if let Some(h) = self.handles[slot].as_ref() {
-                    if let Some(p) = h.take_rx_watermark() {
-                        unsafe { dmesh_doca_conn_rx_watermark(self.doca.raw(), slot as i32, p) };
+                    if let Some(pos) = h.get_dpu_rx_consumed_pos() {
+                        unsafe {
+                            dmesh_doca_conn_update_dpu_rx_consumed_pos(
+                                self.doca.raw(),
+                                slot as i32,
+                                pos,
+                            )
+                        };
                     }
                 }
             }
@@ -651,13 +710,17 @@ impl Driver {
                 guard = ctrl.readable() => {
                     let mut guard = guard.map_err(|e| Error::new(-1, format!("ctrl fd wait: {e}")))?;
                     guard.clear_ready();
-                    check(unsafe { dmesh_doca_ctrl_clear_and_drain(self.doca.raw(), ctrl_fd) })?;
+                    // The next arm clears the SDK notification, then drains.
                 }
                 guard = data.readable() => {
                     let mut guard = guard.map_err(|e| Error::new(-1, format!("data fd wait: {e}")))?;
                     guard.clear_ready();
                     // Work is processed by the bounded drain at the top of the
                     // next iteration.
+                }
+                Some(addr) = request_rx.recv() => { self.request_backend(addr); }
+                Some(registration) = self.reg_rx.recv() => {
+                    self.install_registration(registration);
                 }
                 // Outbound (response) bytes: the stack writing into any
                 // connection's tx (DmeshIo::poll_write -> wake_driver) wakes us
@@ -667,21 +730,22 @@ impl Driver {
                 // 1ms sleep) - 81% of single-stream request latency.
                 _ = std::future::poll_fn(|cx| {
                     for h in self.handles.iter().flatten() {
-                        if h.poll_tx_ready(cx).is_ready() {
+                        if h.poll_driver_ready(cx).is_ready() {
                             return std::task::Poll::Ready(());
                         }
                     }
                     std::task::Poll::Pending
                 }) => {}
-                // Safety net: tokio registers fds edge-triggered, and the DOCA
-                // notification fd does not re-signal while a notification is
-                // already pending - a lost edge would otherwise stall the
-                // datapath forever. A periodic tick bounds the stall to 1ms;
-                // under load the loop never sleeps, so this arm is idle-only.
-                // (Measured: reducing to 100us or busy-polling did NOT change
-                // request latency - the driver poll is not the bottleneck.)
+                // Bound progress of private reverse-DMA PEs and setup work
+                // that has no shared notification fd. RX credits, TX/FIN and
+                // registrations have their own wakes; this is a safety net,
+                // not the normal data-arrival or post-close polling path.
                 _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
             }
+            // Local TX/credit work can stay ready while a ring is full. The
+            // custom poll_fn does not consume Tokio's cooperative budget:
+            // explicitly let H2 tasks run before the next progress pass.
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -746,9 +810,7 @@ mod reader_fence_tests {
     fn failed_acknowledgement_can_retry_without_reopening_io() {
         let (_, handle) = crate::dmesh_io_pair("127.0.0.1:42".parse().unwrap());
         let mut slot = Some(handle);
-        assert!(
-            detach_readers(&mut slot, || Err(Error::new(-1, "injected ack failure"))).is_err()
-        );
+        assert!(detach_readers(&mut slot, || Err(Error::new(-1, "injected ack failure"))).is_err());
         assert!(slot.is_none());
         let mut retried = false;
         detach_readers(&mut slot, || {

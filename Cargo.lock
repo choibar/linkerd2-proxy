@@ -685,6 +685,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cc",
+ "dmesh-routing",
  "libc",
  "linkerd-io",
  "pkg-config",
@@ -706,6 +707,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dmesh-routing"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1858,6 +1868,7 @@ name = "linkerd-app-integration"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "dmesh-routing",
  "flate2",
  "futures",
  "h2",
@@ -1934,6 +1945,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-test",
+ "tokio-util",
  "tonic 0.14.6",
  "tower 0.5.3",
  "tower-test",
@@ -4628,6 +4640,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
