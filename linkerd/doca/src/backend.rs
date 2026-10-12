@@ -46,8 +46,11 @@ extern "C" {
     fn dmesh_dispatch_listener_known(ip: u32, port: u16) -> i32;
 }
 
-/// DMA membership is declared before first publication. Keep tombstones so
-/// removed endpoints cannot accidentally fall through to TCP on stale routes.
+/// DMA membership is declared before first publication: a backend is only
+/// ever published for an address its server LISTENed. The dispatcher keeps a
+/// retired listener known for DMESH_LISTENER_GRACE_MS, so a restarting server
+/// is refused rather than dialled over TCP; after that the address may belong
+/// to a TCP workload (Pod IPs are reused) and is no longer DMA.
 pub fn is_dma(addr: &SocketAddr) -> bool {
     if let SocketAddr::V4(a) = addr {
         let known =
@@ -82,7 +85,7 @@ pub fn is_dma(addr: &SocketAddr) -> bool {
         }
         return known.contains(addr);
     }
-    was_published(addr)
+    false
 }
 
 tokio::task_local! { static WORKER: usize; }

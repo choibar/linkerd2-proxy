@@ -342,8 +342,8 @@ mod backend_owner_tests {
         super::backend::unpublish(b, 0, &addr);
         assert!(!super::backend::has_live(addr));
         assert!(
-            super::backend::is_dma(&addr),
-            "closed DMA endpoint must not fall back to TCP"
+            !super::backend::is_dma(&addr),
+            "membership follows the dispatcher's listeners, not past publication"
         );
     }
 }
