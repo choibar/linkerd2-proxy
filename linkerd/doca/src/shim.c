@@ -399,11 +399,18 @@ int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
 
 /* Update the DPU RX consumed position in this slot's DPA thread
  * (dpa_thread_ctx.rx_consumed_pos in TLS) so the kernel's staging gate can advance. Called
- * from the driver tick only after full segment consumption; one small h2d_memcpy. */
+ * from the driver tick only after full segment consumption. Releases smaller
+ * than DMESH_RX_CONSUMED_POS_BATCH are withheld to amortize the synchronous
+ * h2d_memcpy; the gate still has room for a descriptor and a wrap's skipped tail. */
+#define DMESH_RX_CONSUMED_POS_BATCH (64u * 1024u)
+_Static_assert(DMESH_RX_CONSUMED_POS_BATCH + 2u * 8064u < BUFFER_SIZE,
+               "consumed-position batching must leave room at the staging gate");
+
 int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t slot, uint32_t pos)
 {
 	struct dmesh_conn *conn;
 	struct dmesh_doca_dpa_thread *t;
+	doca_error_t result;
 
 	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
 		return DOCA_ERROR_INVALID_VALUE;
@@ -411,8 +418,14 @@ int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t
 	t = conn->dpa_thread;
 	if (t == NULL || t->thread == NULL || t->local_storage == 0)
 		return DOCA_ERROR_BAD_STATE;
-	return DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
+	pos %= BUFFER_SIZE;
+	if ((pos + BUFFER_SIZE - conn->rx_consumed_pos_published) % BUFFER_SIZE < DMESH_RX_CONSUMED_POS_BATCH)
+		return DOCA_SUCCESS;
+	result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
 				   &pos, sizeof(pos)));
+	if (result == DOCA_SUCCESS)
+		conn->rx_consumed_pos_published = pos;
+	return result;
 }
 
 /* doca_dpa_dev_comch_producer_dma_copy (the fused copy+notify the host reverse
