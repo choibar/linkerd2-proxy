@@ -24,6 +24,7 @@
 #include "object.h"
 #include "dpa.h"
 #include "dpa_common.h"
+#include "dpa_mux.h"
 #include "ring.h"
 
 struct dmesh_doca_probe_report {
@@ -416,13 +417,17 @@ int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t
 		return DOCA_ERROR_INVALID_VALUE;
 	conn = &objs->conns[slot];
 	t = conn->dpa_thread;
-	if (t == NULL || t->thread == NULL || t->local_storage == 0)
+	if (!conn->mux && (t == NULL || t->thread == NULL || t->local_storage == 0))
 		return DOCA_ERROR_BAD_STATE;
 	pos %= BUFFER_SIZE;
 	if ((pos + BUFFER_SIZE - conn->rx_consumed_pos_published) % BUFFER_SIZE < DMESH_RX_CONSUMED_POS_BATCH)
 		return DOCA_SUCCESS;
-	result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
-				   &pos, sizeof(pos)));
+	/* A mux flow's position lives in its ring slot of the thread's state. */
+	if (conn->mux)
+		result = dmesh_dpa_mux_rx_consumed(conn, pos);
+	else
+		result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
+					   &pos, sizeof(pos)));
 	if (result == DOCA_SUCCESS)
 		conn->rx_consumed_pos_published = pos;
 	return result;
