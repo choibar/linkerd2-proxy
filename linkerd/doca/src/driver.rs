@@ -471,6 +471,9 @@ impl Driver {
         if elapsed.as_millis() < 1000 {
             return;
         }
+        if crate::io::qdelay::on() {
+            self.report_qdelay();
+        }
         let cur = self.stats();
         if cur.recv != prev.recv || cur.sent != prev.sent {
             let _ = self.events.send(DmeshEvent::Stats {
@@ -484,6 +487,48 @@ impl Driver {
         }
         *prev = cur;
         *last = Instant::now();
+    }
+
+    /// One `[dmesh-qdelay]` line per slot that recorded samples since the last
+    /// report (`DMESH_QDELAY=1`, see `io::qdelay`). Times in microseconds;
+    /// `rxh`/`txh` carry the raw histograms so windows can be merged offline.
+    fn report_qdelay(&self) {
+        let worker = unsafe { dmesh_doca_worker_id(self.doca.raw()) };
+        let unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let summary = |h: &crate::io::qdelay::Hist| {
+            let us = |ns: u64| ns as f64 / 1e3;
+            format!(
+                "n={} mean={:.1} p50={:.1} p99={:.1} max={:.1}",
+                h.n,
+                us(h.sum_ns.checked_div(h.n).unwrap_or(0)),
+                us(h.quantile_ns(0.5)),
+                us(h.quantile_ns(0.99)),
+                us(h.max_ns),
+            )
+        };
+        for slot in 0..MAX_CONNS {
+            let Some(handle) = self.handles[slot].as_ref() else {
+                continue;
+            };
+            let Some(p) = handle.take_qdelay() else {
+                continue;
+            };
+            let flow = self.conn_flow(slot);
+            eprintln!(
+                "[dmesh-qdelay] unix_ns={unix_ns} worker={worker} slot={slot} flow={}/{} backend={} src={} dst={} rx {} tx {} rxh={} txh={}",
+                flow.key.session_id,
+                flow.key.flow_id,
+                u8::from(flow.is_backend),
+                flow.src,
+                flow.dst,
+                summary(&p.rx),
+                summary(&p.tx),
+                p.rx.encode(),
+                p.tx.encode(),
+            );
+        }
     }
 
     /// Read the flow identity the host reported for a slot's connection.
