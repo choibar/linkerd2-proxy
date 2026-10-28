@@ -98,6 +98,8 @@ extern "C" {
     fn dmesh_doca_conn_send_staged(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> i32;
     fn dmesh_doca_conn_tx_completed(objs: *mut c_void, slot: i32, bytes: *mut u64) -> i32;
     fn dmesh_doca_conn_shutdown(objs: *mut c_void, slot: i32) -> i32;
+    fn dmesh_dispatch_worker_take_migrations(objs: *mut c_void, slots: *mut i32, max: c_int)
+        -> c_int;
 }
 
 /// Global init state (mirrors `enum dmesh_doca_init_state` in comch_server.h)
@@ -177,6 +179,9 @@ pub enum DmeshEvent {
     ConnDraining(usize),
     /// Setup of the connection in this slot failed; the slot is parked.
     ConnError(usize),
+    /// The dispatcher is migrating this client connection to another worker:
+    /// drain it (GOAWAY) so the host reconnects; the slot stays until closed.
+    ConnMigrate(usize),
     /// Periodic datapath report (deltas over `elapsed_ms`, emitted only when
     /// traffic flowed). Rates: msgs/s = recv_msgs * 1000 / elapsed_ms.
     Stats {
@@ -635,6 +640,20 @@ impl Driver {
         }
     }
 
+    fn emit_migrations(&mut self) {
+        let mut slots = [0i32; MAX_CONNS];
+        let n = unsafe {
+            dmesh_dispatch_worker_take_migrations(
+                self.doca.raw(),
+                slots.as_mut_ptr(),
+                MAX_CONNS as c_int,
+            )
+        };
+        for &slot in &slots[..n.max(0) as usize] {
+            let _ = self.events.send(DmeshEvent::ConnMigrate(slot as usize));
+        }
+    }
+
     /// Run the driver until an unrecoverable error. Mirrors the C event loop:
     /// arm both PEs -> drain control -> bounded data drain -> advance ->
     /// emit events -> sleep on either fd unless the data budget was exhausted.
@@ -707,6 +726,7 @@ impl Driver {
 
             self.advance()?;
             self.emit_conn_events();
+            self.emit_migrations();
             // Legacy compatibility hook. Native flow mappings are fenced by
             // the explicit reader acknowledgement before advance().
             unsafe { dmesh_doca_reap_graves(self.doca.raw()) };

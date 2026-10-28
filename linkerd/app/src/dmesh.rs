@@ -17,13 +17,14 @@ use std::sync::Arc;
 use dmesh_doca::{dmesh_io_pair, DmeshEvent, DmeshIo, FlowId, Registrar};
 use linkerd_app_core::{
     identity,
+    proxy::http,
     svc::{self, NewService, Param, ServiceExt},
     tls,
     transport::addrs::{AddrPair, ClientAddr, OrigDstAddr, Remote, ServerAddr},
     Conditional,
 };
 use linkerd_app_inbound::policy::{dmesh_connection_authorized, AllowPolicy};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, debug_span, info, warn, Instrument};
 
 /// Server-side target for a DMA-received connection. Mirrors the `Param` impls
@@ -127,6 +128,9 @@ pub async fn serve<N>(
     // slot -> published backend address, so ConnClosed can unpublish it.
     let mut backend_slots: std::collections::HashMap<usize, SocketAddr> =
         std::collections::HashMap::new();
+    // slot -> the client connection's drain signal, fired to migrate it.
+    let mut migrations: std::collections::HashMap<usize, watch::Sender<bool>> =
+        std::collections::HashMap::new();
     loop {
         let ev = tokio::select! {
             _ = &mut shutdown => return,
@@ -142,8 +146,16 @@ pub async fn serve<N>(
             // registry so the connector refuses instead of handing out a
             // dead channel. Non-backend slots have nothing registered.
             DmeshEvent::ConnClosed(slot) => {
+                migrations.remove(&slot);
                 if let Some(addr) = backend_slots.remove(&slot) {
                     dmesh_doca::backend::unpublish(backend_owner, slot, &addr);
+                }
+                continue;
+            }
+            DmeshEvent::ConnMigrate(slot) => {
+                if let Some(signal) = migrations.get(&slot) {
+                    info!(slot, "dmesh connection migrating; sending GOAWAY");
+                    let _ = signal.send(true);
                 }
                 continue;
             }
@@ -216,13 +228,15 @@ pub async fn serve<N>(
 
                 let span = debug_span!("dmesh", slot, src = %flow.src, orig_dst = %flow.dst);
                 let svc = outbound.new_service(target);
+                let (signal, drain) = watch::channel(false);
+                migrations.insert(slot, signal);
                 tokio::spawn(
-                    async move {
+                    http::conn_drain::scope(drain, async move {
                         match svc.oneshot(io).await {
                             Ok(()) => debug!("dmesh connection closed"),
                             Err(error) => debug!(%error, "dmesh connection failed"),
                         }
-                    }
+                    })
                     .instrument(span),
                 );
             }

@@ -7,6 +7,7 @@ use linkerd_error::Error;
 pub mod balance;
 pub mod client;
 pub mod client_handle;
+pub mod conn_drain;
 pub mod h1;
 pub mod h2;
 mod header_from_target;

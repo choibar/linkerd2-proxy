@@ -330,6 +330,7 @@ where
         let http2 = self.http2.clone();
         let h2_params = self.h2_params.clone();
         let inline = self.inline_streams;
+        let migrate = crate::conn_drain::current();
 
         let res = io.peer_addr().map(|pa| {
             let (handle, closed) = ClientHandle::new(pa);
@@ -368,6 +369,11 @@ where
                                 Pin::new(&mut conn).graceful_shutdown();
                                 conn.await?;
                             }
+                            () = crate::conn_drain::signaled(migrate) => {
+                                debug!("The connection is draining for migration");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                conn.await?;
+                            }
                         }
                     }
 
@@ -385,6 +391,7 @@ where
                             tokio::select! {
                                 _ = drain.signaled() => {}
                                 () = closed => {}
+                                () = crate::conn_drain::signaled(migrate) => {}
                             }
                             let _ = tx.send(());
                         });
@@ -421,6 +428,11 @@ where
                             }
                             () = closed => {
                                 debug!("The stack is tearing down the connection");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                std::future::poll_fn(|cx| poll_conn(&mut conn, inline, cx)).await?;
+                            }
+                            () = crate::conn_drain::signaled(migrate) => {
+                                debug!("The connection is draining for migration");
                                 Pin::new(&mut conn).graceful_shutdown();
                                 std::future::poll_fn(|cx| poll_conn(&mut conn, inline, cx)).await?;
                             }
