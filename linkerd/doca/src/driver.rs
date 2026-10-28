@@ -98,6 +98,7 @@ extern "C" {
     fn dmesh_doca_conn_send_staged(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> i32;
     fn dmesh_doca_conn_tx_completed(objs: *mut c_void, slot: i32, bytes: *mut u64) -> i32;
     fn dmesh_doca_conn_shutdown(objs: *mut c_void, slot: i32) -> i32;
+    fn dmesh_dispatch_worker_flow_stats(objs: *mut c_void, slot: c_int, counters: *const u64);
     fn dmesh_dispatch_worker_take_migrations(objs: *mut c_void, slots: *mut i32, max: c_int)
         -> c_int;
 }
@@ -249,6 +250,9 @@ pub struct Driver {
     t_in: Option<std::time::Instant>,
     dpu_sum_us: u64,
     dpu_cnt: u64,
+    // Flow statistics last handed to the dispatcher (`export_flow_stats`).
+    flowstats_at: Instant,
+    flowstats: Vec<(usize, [u64; 4])>,
 }
 
 // SAFETY: the raw DOCA handle is only dereferenced through &mut self, and a
@@ -294,6 +298,8 @@ impl Driver {
             t_in: None,
             dpu_sum_us: 0,
             dpu_cnt: 0,
+            flowstats_at: Instant::now(),
+            flowstats: Vec::new(),
         };
         (driver, reg_tx)
     }
@@ -640,6 +646,22 @@ impl Driver {
         }
     }
 
+    /// Every 100 ms, copy each counted client connection's statistics to its
+    /// slot, where the dispatcher samples them (see `flowstats`).
+    fn export_flow_stats(&mut self) {
+        if self.flowstats_at.elapsed().as_millis() < 100 {
+            return;
+        }
+        self.flowstats_at = Instant::now();
+        let worker = unsafe { dmesh_doca_worker_id(self.doca.raw()) } as usize;
+        crate::flowstats::snapshot(worker, &mut self.flowstats);
+        for (slot, counters) in &self.flowstats {
+            unsafe {
+                dmesh_dispatch_worker_flow_stats(self.doca.raw(), *slot as c_int, counters.as_ptr())
+            };
+        }
+    }
+
     fn emit_migrations(&mut self) {
         let mut slots = [0i32; MAX_CONNS];
         let n = unsafe {
@@ -727,6 +749,7 @@ impl Driver {
             self.advance()?;
             self.emit_conn_events();
             self.emit_migrations();
+            self.export_flow_stats();
             // Legacy compatibility hook. Native flow mappings are fenced by
             // the explicit reader acknowledgement before advance().
             unsafe { dmesh_doca_reap_graves(self.doca.raw()) };

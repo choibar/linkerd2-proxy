@@ -141,6 +141,11 @@ where
     }
 
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
+        let backend = req
+            .extensions()
+            .get::<crate::flow_stats::FlowCounters>()
+            .cloned()
+            .map(|counters| (counters, std::time::Instant::now()));
         let span = match self {
             Self::H2(_) => debug_span!("h2"),
             Self::Http1(_) => debug_span!("http1"),
@@ -154,7 +159,7 @@ where
             );
             debug!(headers = ?req.headers());
 
-            match self {
+            let rsp = match self {
                 Self::Http1(ref mut svc) => svc.call(req),
                 Self::OrigProtoUpgrade(ref mut svc) => svc.call(req).map_err(Into::into).boxed(),
                 Self::H2(ref mut svc) => Box::pin(
@@ -162,6 +167,14 @@ where
                         .err_into::<Error>()
                         .map_ok(|rsp| rsp.map(BoxBody::new)),
                 ) as RspFuture,
+            };
+            // A request of a counted connection adds its wait for the
+            // backend's response headers (see `flow_stats`).
+            match backend {
+                Some((counters, start)) => {
+                    Box::pin(rsp.inspect(move |_| counters.backend(start))) as RspFuture
+                }
+                None => rsp,
             }
         })
         .instrument(span.or_current())
