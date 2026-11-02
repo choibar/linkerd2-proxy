@@ -375,10 +375,14 @@ int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
 		return DOCA_ERROR_INVALID_VALUE;
 
 	conn = &objs->conns[slot];
-	if (conn->recv_seg_cnt == 0)
-		return conn->host_shut && conn->dpa_comch != NULL &&
-		       conn->dpa_comch->dma_completed >= conn->host_shut_descs ?
-		       DOCA_ERROR_SHUTDOWN : DOCA_ERROR_EMPTY;
+	if (conn->recv_seg_cnt == 0) {
+		/* Forward copies taken so far, one per descriptor: the flow's own
+		 * thread counts them on its msgq, a mux flow on its ring. */
+		uint64_t done = conn->mux ? conn->mux_received :
+				conn->dpa_comch != NULL ? conn->dpa_comch->dma_completed : 0;
+		return conn->host_shut && (conn->mux || conn->dpa_comch != NULL) &&
+		       done >= conn->host_shut_descs ? DOCA_ERROR_SHUTDOWN : DOCA_ERROR_EMPTY;
+	}
 
 	seg = &conn->recv_segs[conn->recv_seg_head];
 	*out_pos = seg->pos;
