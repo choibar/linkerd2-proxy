@@ -252,7 +252,7 @@ pub struct Driver {
     dpu_cnt: u64,
     // Flow statistics last handed to the dispatcher (`export_flow_stats`).
     flowstats_at: Instant,
-    flowstats: Vec<(usize, [u64; 4])>,
+    flowstats: Vec<(usize, [u64; 5])>,
 }
 
 // SAFETY: the raw DOCA handle is only dereferenced through &mut self, and a

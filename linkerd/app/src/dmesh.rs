@@ -27,6 +27,12 @@ use linkerd_app_inbound::policy::{dmesh_connection_authorized, AllowPolicy};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, debug_span, info, warn, Instrument};
 
+/// Counts each DMA client connection's retired instructions with its poll
+/// time; `read` returns the calling thread's instruction count.
+pub fn count_flow_instructions(read: fn() -> u64) {
+    http::flow_stats::set_instruction_reader(read);
+}
+
 /// Server-side target for a DMA-received connection. Mirrors the `Param` impls
 /// of `linkerd_proxy_transport::orig_dst::Addrs` that the outbound stack reads,
 /// plus the source workload identity (`client_id`) that the fused inbound-authz

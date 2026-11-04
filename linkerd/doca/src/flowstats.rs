@@ -8,8 +8,9 @@ use std::{
     sync::{atomic::AtomicU64, Arc, Mutex, OnceLock},
 };
 
-/// Cumulative: requests, CPU ns, residence ns, backend ns.
-pub type Counters = [AtomicU64; 4];
+/// Cumulative: requests, CPU ns, residence ns, backend ns, instructions. The
+/// dispatcher takes all five (`DMESH_FLOW_STATS`).
+pub type Counters = [AtomicU64; 5];
 
 type Registry = Mutex<HashMap<(usize, usize), Arc<Counters>>>;
 
@@ -33,21 +34,25 @@ pub fn unregister(worker: usize, slot: usize, counters: &Arc<Counters>) {
     }
 }
 
+/// Each registered slot of `worker` with all its counters' current values.
+pub fn snapshot_all(worker: usize) -> Vec<(usize, [u64; 5])> {
+    use std::sync::atomic::Ordering::Relaxed;
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((w, _), _)| *w == worker)
+        .map(|((_, slot), c)| (*slot, std::array::from_fn(|i| c[i].load(Relaxed))))
+        .collect()
+}
+
 /// Each registered slot of `worker` with its counters' current values.
-pub(crate) fn snapshot(worker: usize, out: &mut Vec<(usize, [u64; 4])>) {
+pub(crate) fn snapshot(worker: usize, out: &mut Vec<(usize, [u64; 5])>) {
     use std::sync::atomic::Ordering::Relaxed;
     out.clear();
     for ((w, slot), c) in registry().lock().unwrap().iter() {
         if *w == worker {
-            out.push((
-                *slot,
-                [
-                    c[0].load(Relaxed),
-                    c[1].load(Relaxed),
-                    c[2].load(Relaxed),
-                    c[3].load(Relaxed),
-                ],
-            ));
+            out.push((*slot, std::array::from_fn(|i| c[i].load(Relaxed))));
         }
     }
 }

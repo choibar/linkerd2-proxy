@@ -6,9 +6,10 @@
 //! end); the HTTP/2 server's stream tasks add the time they are polled
 //! ([`Executor`]), so a connection's CPU covers its task and its streams; and
 //! the client that forwards a request adds its backend wait (request sent to
-//! response headers). Shared work, such as a backend connection serving many
-//! client connections, is not attributed. `DMESH_FLOW_STATS=0` turns counting
-//! off.
+//! response headers). With an instruction reader set, the same polls also add
+//! the thread's retired instructions. Shared work, such as a backend
+//! connection serving many client connections, is not attributed.
+//! `DMESH_FLOW_STATS=0` turns counting off.
 
 use crate::BoxBody;
 use linkerd_error::Error;
@@ -24,12 +25,23 @@ use std::{
     time::Instant,
 };
 
-/// Cumulative: requests, CPU ns, residence ns, backend ns.
-pub type Counters = [AtomicU64; 4];
+/// Cumulative: requests, CPU ns, residence ns, backend ns, instructions.
+pub type Counters = [AtomicU64; 5];
 pub const REQUESTS: usize = 0;
 pub const CPU_NS: usize = 1;
 pub const RESIDENCE_NS: usize = 2;
 pub const BACKEND_NS: usize = 3;
+pub const INSTRUCTIONS: usize = 4;
+
+/// Reads the polling thread's retired instructions; set once (see
+/// [`set_instruction_reader`]) to count instructions alongside poll time.
+static INSTRUCTION_READER: OnceLock<fn() -> u64> = OnceLock::new();
+
+/// Counts each connection's retired instructions as its tasks are polled,
+/// with `read` returning the calling thread's instruction count.
+pub fn set_instruction_reader(read: fn() -> u64) {
+    let _ = INSTRUCTION_READER.set(read);
+}
 
 tokio::task_local! {
     static COUNTERS: Arc<Counters>;
@@ -89,9 +101,14 @@ impl<F: Future> Future for Cpu<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let this = self.project();
+        let read = INSTRUCTION_READER.get();
+        let i = read.map_or(0, |r| r());
         let t = Instant::now();
         let out = this.inner.poll(cx);
         add(this.counters, CPU_NS, since(t));
+        if let Some(r) = read {
+            add(this.counters, INSTRUCTIONS, r().wrapping_sub(i));
+        }
         out
     }
 }

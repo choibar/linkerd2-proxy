@@ -7,6 +7,7 @@ use std::{
 
 mod driver;
 pub mod flowstats;
+pub mod pmu;
 mod io;
 
 pub use driver::{
