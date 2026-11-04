@@ -233,6 +233,12 @@ fn forward_policy(addr: SocketAddr) -> outbound::OutboundPolicy {
 /// - MOCK_ROUTE_TIMEOUT_MS=T: response T, request 2T, idle T (Timeouts);
 /// - MOCK_ROUTE_RETRY=1: up to 2 retries on 5xx, 64 KiB request buffer,
 ///   1 s timeout, 25-250 ms backoff (Retry).
+///
+/// MOCK_ROUTE_HOSTS=h1,h2,.. puts the profile on its own route that matches
+/// only those request authorities (a route with matching hosts wins over the
+/// host-less default, whose rules stay plain), so client connections with
+/// different authorities get different per-request costs; a request whose
+/// authority does not match never evaluates the profile's rules.
 fn apply_route_profile(policy: &mut outbound::OutboundPolicy) {
     let env = |name: &str| {
         std::env::var(name)
@@ -255,13 +261,47 @@ fn apply_route_profile(policy: &mut outbound::OutboundPolicy) {
     else {
         return;
     };
-    let routes = detect
+    let hosts: Vec<String> = std::env::var("MOCK_ROUTE_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    let route_lists = detect
         .http1
         .iter_mut()
-        .flat_map(|h| h.routes.iter_mut())
-        .chain(detect.http2.iter_mut().flat_map(|h| h.routes.iter_mut()));
-    for route in routes {
-        profile_route(route, rules, headers, timeout_ms, retry);
+        .map(|h| &mut h.routes)
+        .chain(detect.http2.iter_mut().map(|h| &mut h.routes));
+    for routes in route_lists {
+        if hosts.is_empty() {
+            for route in routes.iter_mut() {
+                profile_route(route, rules, headers, timeout_ms, retry);
+            }
+            continue;
+        }
+        let profiled: Vec<_> = routes
+            .iter()
+            .map(|route| {
+                let mut route = route.clone();
+                route.hosts = hosts.iter().map(|h| host_exact(h)).collect();
+                if let Some(linkerd2_proxy_api::meta::Metadata {
+                    kind: Some(linkerd2_proxy_api::meta::metadata::Kind::Default(name)),
+                }) = route.metadata.as_mut()
+                {
+                    name.push_str("-profiled");
+                }
+                profile_route(&mut route, rules, headers, timeout_ms, retry);
+                route
+            })
+            .collect();
+        routes.extend(profiled);
+    }
+}
+
+fn host_exact(host: &str) -> linkerd2_proxy_api::http_route::HostMatch {
+    use linkerd2_proxy_api::http_route::{host_match, HostMatch};
+    HostMatch {
+        r#match: Some(host_match::Match::Exact(host.to_string())),
     }
 }
 
