@@ -24,6 +24,7 @@
 #include "object.h"
 #include "dpa.h"
 #include "dpa_common.h"
+#include "dpa_mux.h"
 #include "ring.h"
 
 struct dmesh_doca_probe_report {
@@ -374,10 +375,14 @@ int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
 		return DOCA_ERROR_INVALID_VALUE;
 
 	conn = &objs->conns[slot];
-	if (conn->recv_seg_cnt == 0)
-		return conn->host_shut && conn->dpa_comch != NULL &&
-		       conn->dpa_comch->dma_completed >= conn->host_shut_descs ?
-		       DOCA_ERROR_SHUTDOWN : DOCA_ERROR_EMPTY;
+	if (conn->recv_seg_cnt == 0) {
+		/* Forward copies taken so far, one per descriptor: the flow's own
+		 * thread counts them on its msgq, a mux flow on its ring. */
+		uint64_t done = conn->mux ? conn->mux_received :
+				conn->dpa_comch != NULL ? conn->dpa_comch->dma_completed : 0;
+		return conn->host_shut && (conn->mux || conn->dpa_comch != NULL) &&
+		       done >= conn->host_shut_descs ? DOCA_ERROR_SHUTDOWN : DOCA_ERROR_EMPTY;
+	}
 
 	seg = &conn->recv_segs[conn->recv_seg_head];
 	*out_pos = seg->pos;
@@ -420,13 +425,17 @@ int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t
 		return DOCA_ERROR_INVALID_VALUE;
 	conn = &objs->conns[slot];
 	t = conn->dpa_thread;
-	if (t == NULL || t->thread == NULL || t->local_storage == 0)
+	if (!conn->mux && (t == NULL || t->thread == NULL || t->local_storage == 0))
 		return DOCA_ERROR_BAD_STATE;
 	pos %= BUFFER_SIZE;
 	if ((pos + BUFFER_SIZE - conn->rx_consumed_pos_published) % BUFFER_SIZE < DMESH_RX_CONSUMED_POS_BATCH)
 		return DOCA_SUCCESS;
-	result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
-				   &pos, sizeof(pos)));
+	/* A mux flow's position lives in its ring slot of the thread's state. */
+	if (conn->mux)
+		result = dmesh_dpa_mux_rx_consumed(conn, pos);
+	else
+		result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
+					   &pos, sizeof(pos)));
 	if (result == DOCA_SUCCESS)
 		conn->rx_consumed_pos_published = pos;
 	return result;
