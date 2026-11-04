@@ -359,8 +359,10 @@ int32_t dmesh_doca_conn_staging_base(struct objects *objs, int32_t slot,
 }
 
 /* Pop the next completed recv segment for a slot into (*out_pos, *out_len).
- * Returns DOCA_SUCCESS with a segment, or DOCA_ERROR_EMPTY when none pending.
- * Single-consumer: only the driver task calls this. */
+ * Returns DOCA_SUCCESS with a segment, DOCA_ERROR_SHUTDOWN at end of stream
+ * (the host closed its sending half and every byte it sent was popped), or
+ * DOCA_ERROR_EMPTY when none pending. Single-consumer: only the driver task
+ * calls this. */
 int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
 				 uint32_t *out_pos, uint32_t *out_len)
 {
@@ -373,7 +375,9 @@ int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
 
 	conn = &objs->conns[slot];
 	if (conn->recv_seg_cnt == 0)
-		return DOCA_ERROR_EMPTY;
+		return conn->host_shut && conn->dpa_comch != NULL &&
+		       conn->dpa_comch->dma_completed >= conn->host_shut_descs ?
+		       DOCA_ERROR_SHUTDOWN : DOCA_ERROR_EMPTY;
 
 	seg = &conn->recv_segs[conn->recv_seg_head];
 	*out_pos = seg->pos;

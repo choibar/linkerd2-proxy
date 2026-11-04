@@ -106,6 +106,8 @@ extern "C" {
 /// Global init state (mirrors `enum dmesh_doca_init_state` in comch_server.h)
 const STATE_ERROR: c_int = -1;
 const STATE_RUNNING: c_int = 1;
+/// `dmesh_doca_conn_recv_pop` at end of stream: the host closed its sending half.
+const DOCA_ERROR_SHUTDOWN: c_int = 10;
 
 /// Per-connection state (mirrors `enum dmesh_conn_state` in object.h)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +375,9 @@ impl Driver {
                     dmesh_doca_conn_recv_pop(self.doca.raw(), slot as i32, &mut pos, &mut len)
                 };
                 if rc != 0 {
+                    if rc == DOCA_ERROR_SHUTDOWN {
+                        handle.close_rx();
+                    }
                     break; // DOCA_ERROR_EMPTY or error
                 }
                 if self.t_in.is_none() {
