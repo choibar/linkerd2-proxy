@@ -98,6 +98,9 @@ extern "C" {
     fn dmesh_doca_conn_send_staged(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> i32;
     fn dmesh_doca_conn_tx_completed(objs: *mut c_void, slot: i32, bytes: *mut u64) -> i32;
     fn dmesh_doca_conn_shutdown(objs: *mut c_void, slot: i32) -> i32;
+    fn dmesh_dispatch_worker_flow_stats(objs: *mut c_void, slot: c_int, counters: *const u64);
+    fn dmesh_dispatch_worker_take_migrations(objs: *mut c_void, slots: *mut i32, max: c_int)
+        -> c_int;
 }
 
 /// Global init state (mirrors `enum dmesh_doca_init_state` in comch_server.h)
@@ -179,6 +182,9 @@ pub enum DmeshEvent {
     ConnDraining(usize),
     /// Setup of the connection in this slot failed; the slot is parked.
     ConnError(usize),
+    /// The dispatcher is migrating this client connection to another worker:
+    /// drain it (GOAWAY) so the host reconnects; the slot stays until closed.
+    ConnMigrate(usize),
     /// Periodic datapath report (deltas over `elapsed_ms`, emitted only when
     /// traffic flowed). Rates: msgs/s = recv_msgs * 1000 / elapsed_ms.
     Stats {
@@ -246,6 +252,9 @@ pub struct Driver {
     t_in: Option<std::time::Instant>,
     dpu_sum_us: u64,
     dpu_cnt: u64,
+    // Flow statistics last handed to the dispatcher (`export_flow_stats`).
+    flowstats_at: Instant,
+    flowstats: Vec<(usize, [u64; 5])>,
 }
 
 // SAFETY: the raw DOCA handle is only dereferenced through &mut self, and a
@@ -291,6 +300,8 @@ impl Driver {
             t_in: None,
             dpu_sum_us: 0,
             dpu_cnt: 0,
+            flowstats_at: Instant::now(),
+            flowstats: Vec::new(),
         };
         (driver, reg_tx)
     }
@@ -476,6 +487,9 @@ impl Driver {
         if elapsed.as_millis() < 1000 {
             return;
         }
+        if crate::io::qdelay::on() {
+            self.report_qdelay();
+        }
         let cur = self.stats();
         if cur.recv != prev.recv || cur.sent != prev.sent {
             let _ = self.events.send(DmeshEvent::Stats {
@@ -489,6 +503,48 @@ impl Driver {
         }
         *prev = cur;
         *last = Instant::now();
+    }
+
+    /// One `[dmesh-qdelay]` line per slot that recorded samples since the last
+    /// report (`DMESH_QDELAY=1`, see `io::qdelay`). Times in microseconds;
+    /// `rxh`/`txh` carry the raw histograms so windows can be merged offline.
+    fn report_qdelay(&self) {
+        let worker = unsafe { dmesh_doca_worker_id(self.doca.raw()) };
+        let unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let summary = |h: &crate::io::qdelay::Hist| {
+            let us = |ns: u64| ns as f64 / 1e3;
+            format!(
+                "n={} mean={:.1} p50={:.1} p99={:.1} max={:.1}",
+                h.n,
+                us(h.sum_ns.checked_div(h.n).unwrap_or(0)),
+                us(h.quantile_ns(0.5)),
+                us(h.quantile_ns(0.99)),
+                us(h.max_ns),
+            )
+        };
+        for slot in 0..MAX_CONNS {
+            let Some(handle) = self.handles[slot].as_ref() else {
+                continue;
+            };
+            let Some(p) = handle.take_qdelay() else {
+                continue;
+            };
+            let flow = self.conn_flow(slot);
+            eprintln!(
+                "[dmesh-qdelay] unix_ns={unix_ns} worker={worker} slot={slot} flow={}/{} backend={} src={} dst={} rx {} tx {} rxh={} txh={}",
+                flow.key.session_id,
+                flow.key.flow_id,
+                u8::from(flow.is_backend),
+                flow.src,
+                flow.dst,
+                summary(&p.rx),
+                summary(&p.tx),
+                p.rx.encode(),
+                p.tx.encode(),
+            );
+        }
     }
 
     /// Read the flow identity the host reported for a slot's connection.
@@ -595,6 +651,36 @@ impl Driver {
         }
     }
 
+    /// Every 100 ms, copy each counted client connection's statistics to its
+    /// slot, where the dispatcher samples them (see `flowstats`).
+    fn export_flow_stats(&mut self) {
+        if self.flowstats_at.elapsed().as_millis() < 100 {
+            return;
+        }
+        self.flowstats_at = Instant::now();
+        let worker = unsafe { dmesh_doca_worker_id(self.doca.raw()) } as usize;
+        crate::flowstats::snapshot(worker, &mut self.flowstats);
+        for (slot, counters) in &self.flowstats {
+            unsafe {
+                dmesh_dispatch_worker_flow_stats(self.doca.raw(), *slot as c_int, counters.as_ptr())
+            };
+        }
+    }
+
+    fn emit_migrations(&mut self) {
+        let mut slots = [0i32; MAX_CONNS];
+        let n = unsafe {
+            dmesh_dispatch_worker_take_migrations(
+                self.doca.raw(),
+                slots.as_mut_ptr(),
+                MAX_CONNS as c_int,
+            )
+        };
+        for &slot in &slots[..n.max(0) as usize] {
+            let _ = self.events.send(DmeshEvent::ConnMigrate(slot as usize));
+        }
+    }
+
     /// Run the driver until an unrecoverable error. Mirrors the C event loop:
     /// arm both PEs -> drain control -> bounded data drain -> advance ->
     /// emit events -> sleep on either fd unless the data budget was exhausted.
@@ -667,6 +753,8 @@ impl Driver {
 
             self.advance()?;
             self.emit_conn_events();
+            self.emit_migrations();
+            self.export_flow_stats();
             // Legacy compatibility hook. Native flow mappings are fenced by
             // the explicit reader acknowledgement before advance().
             unsafe { dmesh_doca_reap_graves(self.doca.raw()) };

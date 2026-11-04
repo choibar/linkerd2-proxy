@@ -18,6 +18,8 @@ use tracing::{debug, info, warn};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod rt;
+#[cfg(feature = "doca")]
+mod taskstat;
 
 const EX_USAGE: i32 = 64;
 
@@ -201,6 +203,19 @@ fn main() {
         // Sharded mode: one pinned thread + current_thread runtime per worker.
         // Select distinct online CPUs inside the launch affinity, highest first.
         #[cfg(feature = "doca")]
+        let flow_instr = std::env::var("DMESH_FLOW_INSTR").map_or(true, |v| v != "0");
+        #[cfg(feature = "doca")]
+        if flow_instr
+            && dmesh_sharded
+            && std::fs::read_to_string("/proc/sys/kernel/perf_user_access")
+                .map_or(true, |v| v.trim() != "1")
+        {
+            warn!(
+                "kernel.perf_user_access is not 1: flows count no instructions, \
+                 so least-instr placement falls back to the fewest flows"
+            );
+        }
+        #[cfg(feature = "doca")]
         for (i, driver, dmesh_rx, registrar) in dmesh_shards {
             let serve = app.dmesh_serve_future(i, dmesh_rx, registrar);
             let core = worker_cores[i];
@@ -210,12 +225,26 @@ fn main() {
                     if !dmesh_doca::pin_current_thread_to_core(core) {
                         warn!(worker = i, core, "dmesh shard: failed to pin core");
                     }
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("dmesh shard runtime");
+                    let mut builder = tokio::runtime::Builder::new_current_thread();
+                    builder.enable_all();
+                    let taskstat = taskstat::enabled();
+                    if taskstat {
+                        taskstat::install(&mut builder);
+                    }
+                    // Per-flow retired instructions, the dispatcher's least-instr
+                    // placement signal: on unless DMESH_FLOW_INSTR=0 (always with
+                    // the task statistics).
+                    if taskstat || flow_instr {
+                        linkerd_app::dmesh::count_flow_instructions(
+                            dmesh_doca::pmu::thread_instructions,
+                        );
+                    }
+                    let rt = builder.build().expect("dmesh shard runtime");
                     rt.block_on(async move {
                         dmesh_doca::backend::register_worker(i);
+                        if taskstat {
+                            tokio::spawn(taskstat::report(i));
+                        }
                         info!(
                             worker = i,
                             core, "dmesh shard running (pinned current_thread runtime)"

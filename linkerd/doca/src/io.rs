@@ -144,6 +144,116 @@ mod seg_cache {
         let _ = base;
     }
 }
+/// Queueing-delay probe, `DMESH_QDELAY=1`. RX: a segment delivered by the
+/// driver waits until the stack's first read of it (the connection task's
+/// run-queue wait). TX: the first unpublished byte the stack staged waits until
+/// the driver has published the whole run. One process-wide monotonic clock;
+/// histograms live under the connection mutex, so recording adds no
+/// synchronization. The driver drains them once per second.
+pub mod qdelay {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("DMESH_QDELAY").is_some())
+    }
+
+    /// Nanoseconds since the first call; never 0, so 0 can mean "unset".
+    pub(crate) fn now_ns() -> u64 {
+        static BASE: OnceLock<Instant> = OnceLock::new();
+        BASE.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 1
+    }
+
+    /// Log-linear buckets: 16 per power of two (~6% resolution), up to ~33 s.
+    const SUB: u64 = 16;
+    const BUCKETS: usize = 512;
+
+    pub struct Hist {
+        counts: Vec<u32>,
+        pub n: u64,
+        pub sum_ns: u64,
+        pub max_ns: u64,
+    }
+
+    impl Default for Hist {
+        fn default() -> Self {
+            Self {
+                counts: vec![0; BUCKETS],
+                n: 0,
+                sum_ns: 0,
+                max_ns: 0,
+            }
+        }
+    }
+
+    fn index(v: u64) -> usize {
+        if v < SUB {
+            return v as usize;
+        }
+        let shift = 63 - v.leading_zeros() as u64 - 4;
+        (((shift + 1) * SUB + ((v >> shift) & (SUB - 1))) as usize).min(BUCKETS - 1)
+    }
+
+    fn lower(i: usize) -> u64 {
+        if i < SUB as usize {
+            return i as u64;
+        }
+        (SUB + i as u64 % SUB) << (i as u64 / SUB - 1)
+    }
+
+    impl Hist {
+        pub(crate) fn record(&mut self, ns: u64) {
+            let c = &mut self.counts[index(ns)];
+            *c = c.saturating_add(1);
+            self.n += 1;
+            self.sum_ns += ns;
+            self.max_ns = self.max_ns.max(ns);
+        }
+
+        /// Lower bound of the bucket holding the q-quantile.
+        pub fn quantile_ns(&self, q: f64) -> u64 {
+            let target = ((q * self.n as f64).ceil() as u64).max(1);
+            let mut seen = 0;
+            for (i, &c) in self.counts.iter().enumerate() {
+                seen += c as u64;
+                if seen >= target {
+                    return lower(i);
+                }
+            }
+            self.max_ns
+        }
+
+        /// Non-empty buckets as `index:count,...`, for offline merging.
+        pub fn encode(&self) -> String {
+            let mut s = String::new();
+            for (i, &c) in self.counts.iter().enumerate().filter(|(_, &c)| c != 0) {
+                if !s.is_empty() {
+                    s.push(',');
+                }
+                s.push_str(&format!("{i}:{c}"));
+            }
+            s
+        }
+    }
+
+    #[derive(Default)]
+    pub struct Probe {
+        pub rx: Hist,
+        pub tx: Hist,
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn buckets_bound_their_values() {
+        for v in [0, 1, 15, 16, 17, 31, 32, 33, 1000, 123_456, 9_999_999_999] {
+            let i = index(v);
+            assert!(lower(i) <= v, "{v}");
+            assert!(i + 1 == BUCKETS || lower(i + 1) > v, "{v}");
+        }
+    }
+}
+
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -166,6 +276,12 @@ struct Inner {
     /// A segment was fully consumed since the last get_dpu_rx_consumed_pos call.
     dpu_rx_consumed_pos_changed: bool,
     seg_read_off: usize, // partial-consume cursor into segs.front()
+    /// `qdelay`: delivery time of each segment not yet first read; its front
+    /// is the first segment the reader has not started.
+    seg_ts: VecDeque<u64>,
+    /// `qdelay`: when the oldest unpublished TX byte was staged (0 = none).
+    tx_run_start: u64,
+    qdelay: Option<Box<qdelay::Probe>>,
 
     /// Peer half closed: reads drain rx/segs then return EOF.
     rx_closed: bool,
@@ -215,6 +331,9 @@ impl Inner {
     }
     fn tx_unpublished(&self) -> u64 {
         self.tx_write - self.tx_publish
+    }
+    fn probe(&mut self) -> &mut qdelay::Probe {
+        self.qdelay.get_or_insert_with(Default::default)
     }
 }
 
@@ -280,6 +399,12 @@ impl AsyncRead for DmeshIo {
         if let Some(&(pos, len)) = inner.segs.front() {
             let seg_len = len as usize;
             let off = inner.seg_read_off;
+            if off == 0 {
+                if let Some(t) = inner.seg_ts.pop_front() {
+                    let waited = qdelay::now_ns().saturating_sub(t);
+                    inner.probe().rx.record(waited);
+                }
+            }
             let avail = seg_len - off;
             let n = buf.remaining().min(avail);
             let base = inner.staging_base as *const u8;
@@ -355,6 +480,9 @@ impl AsyncWrite for DmeshIo {
             if first < n {
                 std::ptr::copy_nonoverlapping(data.as_ptr().add(first), base, n - first);
             }
+        }
+        if qdelay::on() && inner.tx_run_start == 0 {
+            inner.tx_run_start = qdelay::now_ns();
         }
         inner.tx_write += n as u64;
         inner.wake_driver();
@@ -452,7 +580,15 @@ impl DmeshIoHandle {
             }
         }
         inner.segs.push_back((pos, len));
+        if qdelay::on() {
+            inner.seg_ts.push_back(qdelay::now_ns());
+        }
         inner.wake_reader();
+    }
+
+    /// Take the `qdelay` histograms recorded since the last call.
+    pub fn take_qdelay(&self) -> Option<Box<qdelay::Probe>> {
+        self.inner.lock().unwrap().qdelay.take()
     }
 
     /// Deliver owned bytes to the reading stack (copy path; tests / non-DMA).
@@ -470,6 +606,7 @@ impl DmeshIoHandle {
         let mut inner = self.inner.lock().unwrap();
         inner.staging_base = 0;
         inner.segs.clear();
+        inner.seg_ts.clear();
         inner.seg_read_off = 0;
         inner.rx_closed = true;
         inner.wake_reader();
@@ -508,6 +645,11 @@ impl DmeshIoHandle {
         let mut inner = self.inner.lock().unwrap();
         debug_assert!(n as u64 <= inner.tx_unpublished());
         inner.tx_publish += n as u64;
+        if inner.tx_run_start != 0 && inner.tx_unpublished() == 0 {
+            let waited = qdelay::now_ns().saturating_sub(inner.tx_run_start);
+            inner.tx_run_start = 0;
+            inner.probe().tx.record(waited);
+        }
     }
 
     /// Complete the contiguous successful prefix of this flow's DMA copies.

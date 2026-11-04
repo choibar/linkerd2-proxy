@@ -201,6 +201,8 @@ fn forward_policy(addr: SocketAddr) -> outbound::OutboundPolicy {
         }
     }
 
+    apply_route_profile(&mut policy);
+
     // MOCK_OUTBOUND_OPAQUE=1 replaces the Detect protocol with a BARE Opaque
     // protocol: the outbound stack then skips HTTP protocol detection and
     // L4-forwards the connection (no h2 termination), so we can measure the
@@ -218,6 +220,170 @@ fn forward_policy(addr: SocketAddr) -> outbound::OutboundPolicy {
     }
 
     policy
+}
+
+/// Route policy for per-request cost experiments, applied to every HTTP route
+/// this mock serves (what HTTPRoute resources become through the policy
+/// controller):
+/// - MOCK_ROUTE_RULES=N: N more rules ahead of the catch-all, each matching
+///   the path by regex and `content-type` by a regex no request satisfies, so
+///   every request evaluates 2N regexes and falls through to the catch-all;
+/// - MOCK_ROUTE_SET_HEADERS=K: the catch-all sets K request headers
+///   (RequestHeaderModifier);
+/// - MOCK_ROUTE_TIMEOUT_MS=T: response T, request 2T, idle T (Timeouts);
+/// - MOCK_ROUTE_RETRY=1: up to 2 retries on 5xx, 64 KiB request buffer,
+///   1 s timeout, 25-250 ms backoff (Retry).
+///
+/// MOCK_ROUTE_HOSTS=h1,h2,.. puts the profile on its own route that matches
+/// only those request authorities (a route with matching hosts wins over the
+/// host-less default, whose rules stay plain), so client connections with
+/// different authorities get different per-request costs; a request whose
+/// authority does not match never evaluates the profile's rules.
+fn apply_route_profile(policy: &mut outbound::OutboundPolicy) {
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let (rules, headers, timeout_ms, retry) = (
+        env("MOCK_ROUTE_RULES"),
+        env("MOCK_ROUTE_SET_HEADERS"),
+        env("MOCK_ROUTE_TIMEOUT_MS"),
+        env("MOCK_ROUTE_RETRY") != 0,
+    );
+    if rules == 0 && headers == 0 && timeout_ms == 0 && !retry {
+        return;
+    }
+    let Some(outbound::ProxyProtocol {
+        kind: Some(outbound::proxy_protocol::Kind::Detect(detect)),
+    }) = policy.protocol.as_mut()
+    else {
+        return;
+    };
+    let hosts: Vec<String> = std::env::var("MOCK_ROUTE_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    let route_lists = detect
+        .http1
+        .iter_mut()
+        .map(|h| &mut h.routes)
+        .chain(detect.http2.iter_mut().map(|h| &mut h.routes));
+    for routes in route_lists {
+        if hosts.is_empty() {
+            for route in routes.iter_mut() {
+                profile_route(route, rules, headers, timeout_ms, retry);
+            }
+            continue;
+        }
+        let profiled: Vec<_> = routes
+            .iter()
+            .map(|route| {
+                let mut route = route.clone();
+                route.hosts = hosts.iter().map(|h| host_exact(h)).collect();
+                if let Some(linkerd2_proxy_api::meta::Metadata {
+                    kind: Some(linkerd2_proxy_api::meta::metadata::Kind::Default(name)),
+                }) = route.metadata.as_mut()
+                {
+                    name.push_str("-profiled");
+                }
+                profile_route(&mut route, rules, headers, timeout_ms, retry);
+                route
+            })
+            .collect();
+        routes.extend(profiled);
+    }
+}
+
+fn host_exact(host: &str) -> linkerd2_proxy_api::http_route::HostMatch {
+    use linkerd2_proxy_api::http_route::{host_match, HostMatch};
+    HostMatch {
+        r#match: Some(host_match::Match::Exact(host.to_string())),
+    }
+}
+
+fn profile_route(
+    route: &mut outbound::HttpRoute,
+    rules: u64,
+    headers: u64,
+    timeout_ms: u64,
+    retry: bool,
+) {
+    use linkerd2_proxy_api::{http_route, http_types};
+    use std::time::Duration;
+    let Some(catch_all) = route.rules.first_mut() else {
+        return;
+    };
+    if headers > 0 {
+        let set = (0..headers)
+            .map(|i| http_types::headers::Header {
+                name: format!("x-route-h{i}"),
+                value: format!("route-value-{i:04}-0123456789abcdef").into_bytes(),
+            })
+            .collect();
+        catch_all.filters.push(outbound::http_route::Filter {
+            kind: Some(outbound::http_route::filter::Kind::RequestHeaderModifier(
+                http_route::RequestHeaderModifier {
+                    add: None,
+                    set: Some(http_types::Headers { headers: set }),
+                    remove: Vec::new(),
+                },
+            )),
+        });
+    }
+    if timeout_ms > 0 {
+        let t = |ms: u64| Duration::from_millis(ms).try_into().ok();
+        catch_all.timeouts = Some(http_route::Timeouts {
+            response: t(timeout_ms),
+            request: t(2 * timeout_ms),
+            idle: t(timeout_ms),
+        });
+    }
+    if retry {
+        catch_all.retry = Some(outbound::http_route::Retry {
+            max_retries: 2,
+            max_request_bytes: 64 * 1024,
+            conditions: Some(outbound::http_route::retry::Conditions {
+                status_ranges: vec![outbound::http_route::retry::conditions::StatusRange {
+                    start: 500,
+                    end: 599,
+                }],
+            }),
+            timeout: Duration::from_secs(1).try_into().ok(),
+            backoff: Some(outbound::ExponentialBackoff {
+                min_backoff: Duration::from_millis(25).try_into().ok(),
+                max_backoff: Duration::from_millis(250).try_into().ok(),
+                jitter_ratio: 0.5,
+                respect_retry_after_hint: false,
+            }),
+        });
+    }
+    let template = catch_all.clone();
+    let fillers = (0..rules).map(|i| {
+        let mut rule = template.clone();
+        rule.filters.clear();
+        rule.matches = vec![http_route::HttpRouteMatch {
+            path: Some(http_route::PathMatch {
+                kind: Some(http_route::path_match::Kind::Regex(
+                    "^/[A-Za-z0-9_.]+/[A-Za-z0-9_]+$".to_string(),
+                )),
+            }),
+            headers: vec![http_route::HeaderMatch {
+                name: "content-type".to_string(),
+                value: Some(http_route::header_match::Value::Regex(format!(
+                    "^application/(json|xml)\\+v{i}(;.*)?$"
+                ))),
+            }],
+            query_params: Vec::new(),
+            method: None,
+        }];
+        rule
+    });
+    let fillers: Vec<_> = fillers.collect();
+    route.rules.splice(0..0, fillers);
 }
 
 fn replace_http_route_backends(route: &mut outbound::HttpRoute, addr: SocketAddr) {

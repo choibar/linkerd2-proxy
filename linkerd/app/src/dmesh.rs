@@ -17,14 +17,21 @@ use std::sync::Arc;
 use dmesh_doca::{dmesh_io_pair, DmeshEvent, DmeshIo, FlowId, Registrar};
 use linkerd_app_core::{
     identity,
+    proxy::http,
     svc::{self, NewService, Param, ServiceExt},
     tls,
     transport::addrs::{AddrPair, ClientAddr, OrigDstAddr, Remote, ServerAddr},
     Conditional,
 };
 use linkerd_app_inbound::policy::{dmesh_connection_authorized, AllowPolicy};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, debug_span, info, warn, Instrument};
+
+/// Counts each DMA client connection's retired instructions with its poll
+/// time; `read` returns the calling thread's instruction count.
+pub fn count_flow_instructions(read: fn() -> u64) {
+    http::flow_stats::set_instruction_reader(read);
+}
 
 /// Server-side target for a DMA-received connection. Mirrors the `Param` impls
 /// of `linkerd_proxy_transport::orig_dst::Addrs` that the outbound stack reads,
@@ -127,6 +134,14 @@ pub async fn serve<N>(
     // slot -> published backend address, so ConnClosed can unpublish it.
     let mut backend_slots: std::collections::HashMap<usize, SocketAddr> =
         std::collections::HashMap::new();
+    // slot -> the client connection's drain signal, fired to migrate it.
+    let mut migrations: std::collections::HashMap<usize, watch::Sender<bool>> =
+        std::collections::HashMap::new();
+    // slot -> (worker, the client connection's flow statistics).
+    let mut flow_stats: std::collections::HashMap<
+        usize,
+        (usize, Arc<dmesh_doca::flowstats::Counters>),
+    > = std::collections::HashMap::new();
     loop {
         let ev = tokio::select! {
             _ = &mut shutdown => return,
@@ -142,8 +157,19 @@ pub async fn serve<N>(
             // registry so the connector refuses instead of handing out a
             // dead channel. Non-backend slots have nothing registered.
             DmeshEvent::ConnClosed(slot) => {
+                migrations.remove(&slot);
+                if let Some((worker, counters)) = flow_stats.remove(&slot) {
+                    dmesh_doca::flowstats::unregister(worker, slot, &counters);
+                }
                 if let Some(addr) = backend_slots.remove(&slot) {
                     dmesh_doca::backend::unpublish(backend_owner, slot, &addr);
+                }
+                continue;
+            }
+            DmeshEvent::ConnMigrate(slot) => {
+                if let Some(signal) = migrations.get(&slot) {
+                    info!(slot, "dmesh connection migrating; sending GOAWAY");
+                    let _ = signal.send(true);
                 }
                 continue;
             }
@@ -216,15 +242,29 @@ pub async fn serve<N>(
 
                 let span = debug_span!("dmesh", slot, src = %flow.src, orig_dst = %flow.dst);
                 let svc = outbound.new_service(target);
-                tokio::spawn(
-                    async move {
-                        match svc.oneshot(io).await {
-                            Ok(()) => debug!("dmesh connection closed"),
-                            Err(error) => debug!(%error, "dmesh connection failed"),
-                        }
+                let (signal, drain) = watch::channel(false);
+                migrations.insert(slot, signal);
+                let serve = http::conn_drain::scope(drain, async move {
+                    match svc.oneshot(io).await {
+                        Ok(()) => debug!("dmesh connection closed"),
+                        Err(error) => debug!(%error, "dmesh connection failed"),
                     }
-                    .instrument(span),
-                );
+                });
+                if http::flow_stats::enabled() {
+                    // Count this connection's requests, CPU and backend wait
+                    // for the dispatcher's flow placement.
+                    let worker = flow.location.worker as usize;
+                    let counters: Arc<http::flow_stats::Counters> = Arc::new(Default::default());
+                    dmesh_doca::flowstats::register(worker, slot, counters.clone());
+                    flow_stats.insert(slot, (worker, counters.clone()));
+                    let serve = http::flow_stats::Cpu::new(
+                        http::flow_stats::scope(counters.clone(), serve),
+                        counters,
+                    );
+                    tokio::spawn(serve.instrument(span));
+                } else {
+                    tokio::spawn(serve.instrument(span));
+                }
             }
             DmeshEvent::InfraReady => info!("dmesh infrastructure ready"),
             DmeshEvent::Stats {

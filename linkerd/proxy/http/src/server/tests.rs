@@ -2,6 +2,7 @@ use super::*;
 use bytes::Bytes;
 use futures::FutureExt;
 use http_body_util::BodyExt;
+use hyper_util::rt::tokio::TokioExecutor;
 use linkerd_io as io;
 use linkerd_stack::CloneParam;
 use std::vec;

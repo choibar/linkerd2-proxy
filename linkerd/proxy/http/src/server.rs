@@ -1,5 +1,4 @@
 use crate::{client_handle::SetClientHandle, h2, BoxBody, ClientHandle, Variant};
-use hyper_util::rt::tokio::TokioExecutor;
 use linkerd_error::Error;
 use linkerd_http_box::BoxRequest;
 use linkerd_io::{self as io, PeerAddr};
@@ -37,7 +36,7 @@ pub struct NewServeHttp<X, N> {
 pub struct ServeHttp<N> {
     version: Variant,
     http1: hyper::server::conn::http1::Builder,
-    http2: hyper::server::conn::http2::Builder<TokioExecutor>,
+    http2: hyper::server::conn::http2::Builder<crate::flow_stats::Executor>,
     /// Raw params, kept so the nghttp2 engine can consume them directly.
     h2_params: h2::ServerParams,
     /// Drive h2 stream futures inline from the connection future (no task
@@ -84,7 +83,7 @@ where
             max_pending_accept_reset_streams,
         } = h2;
 
-        let mut http2 = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        let mut http2 = hyper::server::conn::http2::Builder::new(crate::flow_stats::Executor);
         http2.timer(hyper_util::rt::TokioTimer::new());
         match flow_control {
             None => {}
@@ -330,11 +329,14 @@ where
         let http2 = self.http2.clone();
         let h2_params = self.h2_params.clone();
         let inline = self.inline_streams;
+        let migrate = crate::conn_drain::current();
+        let counters = crate::flow_stats::current();
 
         let res = io.peer_addr().map(|pa| {
             let (handle, closed) = ClientHandle::new(pa);
             let svc = self.inner.new_service(handle.clone());
             let svc = SetClientHandle::new(handle, svc);
+            let svc = crate::flow_stats::CountRequests::new(svc, counters);
             (svc, closed)
         });
 
@@ -368,6 +370,11 @@ where
                                 Pin::new(&mut conn).graceful_shutdown();
                                 conn.await?;
                             }
+                            () = crate::conn_drain::signaled(migrate) => {
+                                debug!("The connection is draining for migration");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                conn.await?;
+                            }
                         }
                     }
 
@@ -385,6 +392,7 @@ where
                             tokio::select! {
                                 _ = drain.signaled() => {}
                                 () = closed => {}
+                                () = crate::conn_drain::signaled(migrate) => {}
                             }
                             let _ = tx.send(());
                         });
@@ -421,6 +429,11 @@ where
                             }
                             () = closed => {
                                 debug!("The stack is tearing down the connection");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                std::future::poll_fn(|cx| poll_conn(&mut conn, inline, cx)).await?;
+                            }
+                            () = crate::conn_drain::signaled(migrate) => {
+                                debug!("The connection is draining for migration");
                                 Pin::new(&mut conn).graceful_shutdown();
                                 std::future::poll_fn(|cx| poll_conn(&mut conn, inline, cx)).await?;
                             }
