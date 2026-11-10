@@ -10,6 +10,7 @@
 mod accept;
 mod detect;
 pub mod direct;
+pub mod fused;
 mod http;
 mod metrics;
 pub mod policy;
