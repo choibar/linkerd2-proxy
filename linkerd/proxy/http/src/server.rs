@@ -331,11 +331,13 @@ where
         let inline = self.inline_streams;
         let migrate = crate::conn_drain::current();
         let counters = crate::flow_stats::current();
+        let wrap = crate::conn_wrap::current();
 
         let res = io.peer_addr().map(|pa| {
             let (handle, closed) = ClientHandle::new(pa);
             let svc = self.inner.new_service(handle.clone());
             let svc = SetClientHandle::new(handle, svc);
+            let svc = crate::conn_wrap::Wrapped::new(svc, wrap);
             let svc = crate::flow_stats::CountRequests::new(svc, counters);
             (svc, closed)
         });
