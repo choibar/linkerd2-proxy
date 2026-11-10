@@ -36,7 +36,7 @@ hyper-util = { workspace = true, default-features = false, features = [
 pin-project = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
-tower = { workspace = true, default-features = false }
+tower = { workspace = true, default-features = false, features = ["util"] }
 tracing = { workspace = true }
 
 linkerd-error = { path = "../../error" }
