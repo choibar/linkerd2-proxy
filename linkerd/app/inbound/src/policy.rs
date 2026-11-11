@@ -11,8 +11,8 @@ pub(crate) use self::store::Store;
 pub use self::{
     config::Config,
     http::{
-        HttpInvalidPolicy, HttpRouteInvalidRedirect, HttpRouteNotFound, HttpRouteRedirect,
-        HttpRouteUnauthorized, NewHttpPolicy, PermitVariant, Permitted,
+        FusedHttpPolicy, HttpInvalidPolicy, HttpRouteInvalidRedirect, HttpRouteNotFound,
+        HttpRouteRedirect, HttpRouteUnauthorized, NewHttpPolicy, PermitVariant, Permitted,
     },
     tcp::NewTcpPolicy,
 };
@@ -45,6 +45,14 @@ pub struct ServerUnauthorized {
 pub trait GetPolicy {
     /// Returns the traffic policy configured for the destination address.
     fn get_policy(&self, dst: OrigDstAddr) -> AllowPolicy;
+}
+
+/// A policy store may be held behind a pointer, so that a proxy serving many
+/// destination workloads (the DMA path) can keep one store per workload.
+impl<T: GetPolicy + ?Sized> GetPolicy for Arc<T> {
+    fn get_policy(&self, dst: OrigDstAddr) -> AllowPolicy {
+        (**self).get_policy(dst)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -177,9 +185,13 @@ impl AllowPolicy {
 /// the exact per-authorization decision of the normal inbound path
 /// ([`is_authorized`]). For HTTP/gRPC services, whose authorizations are
 /// per-route, a connection is permitted if the client is authorized by ANY
-/// route rule — sufficient for a Server-scoped `AuthorizationPolicy` where all
-/// routes share the default authorization. Returns true if `client`/`tls` may
-/// reach the server behind `policy`.
+/// route rule; each request is then authorized against its own route by
+/// [`FusedHttpPolicy`]. A server whose protocol is detected (`Detect`, a
+/// `Server` without `proxyProtocol`) carries both kinds: the connection is
+/// permitted by its TCP authorizations or by any HTTP route rule, because a
+/// route-scoped `AuthorizationPolicy` leaves the TCP authorizations empty
+/// while HTTP requests on the connection may still be authorized. Returns
+/// true if `client`/`tls` may reach the server behind `policy`.
 pub fn dmesh_connection_authorized(
     policy: &AllowPolicy,
     client_addr: Remote<ClientAddr>,
@@ -189,8 +201,16 @@ pub fn dmesh_connection_authorized(
     let any = |authzs: &[Authorization]| authzs.iter().any(|a| is_authorized(a, client_addr, tls));
     match &server.protocol {
         Protocol::Detect {
-            tcp_authorizations, ..
-        } => any(tcp_authorizations),
+            http,
+            tcp_authorizations,
+            ..
+        } => {
+            any(tcp_authorizations)
+                || http
+                    .iter()
+                    .flat_map(|r| r.rules.iter())
+                    .any(|rule| any(&rule.policy.authorizations))
+        }
         Protocol::Opaque(authzs) | Protocol::Tls(authzs) => any(authzs),
         Protocol::Http1(routes) | Protocol::Http2(routes) => routes
             .iter()

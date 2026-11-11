@@ -89,6 +89,8 @@ pub struct App {
     #[cfg(feature = "doca")]
     dmesh_policies: dmesh::DmeshGetPolicy,
     #[cfg(feature = "doca")]
+    dmesh_http_wrap: dmesh::DmeshHttpWrap,
+    #[cfg(feature = "doca")]
     dmesh_drain: drain::Watch,
 }
 
@@ -244,6 +246,29 @@ impl Config {
             policies.limits,
         );
 
+        // One inbound policy store per destination workload, built on first
+        // use: this proxy is the inbound enforcement point of every
+        // destination its DMA path serves (see `dmesh::inbound_workloads_from_env`).
+        #[cfg(feature = "doca")]
+        let dmesh_workload_policies: std::sync::Arc<
+            dyn Fn(std::sync::Arc<str>) -> std::sync::Arc<dyn inbound::policy::GetPolicy + Send + Sync>
+                + Send
+                + Sync,
+        > = {
+            let inbound = inbound.clone();
+            let client = policies.client.clone();
+            let backoff = policies.backoff;
+            let limits = policies.limits;
+            std::sync::Arc::new(move |workload| {
+                std::sync::Arc::new(inbound.build_policies(
+                    workload,
+                    client.clone(),
+                    backoff,
+                    limits,
+                ))
+            })
+        };
+
         let outbound_policies = outbound.build_policies(
             policies.workload.clone(),
             policies.client.clone(),
@@ -293,7 +318,34 @@ impl Config {
         #[cfg(feature = "doca")]
         let dmesh_policies: dmesh::DmeshGetPolicy = {
             let p = inbound_policies.clone();
-            std::sync::Arc::new(move |dst| inbound::policy::GetPolicy::get_policy(&p, dst))
+            let workloads = dmesh::inbound_workloads_from_env();
+            let stores = std::sync::Mutex::new(std::collections::HashMap::<
+                std::sync::Arc<str>,
+                std::sync::Arc<dyn inbound::policy::GetPolicy + Send + Sync>,
+            >::new());
+            std::sync::Arc::new(move |dst: OrigDstAddr| {
+                match workloads.get(&dst.ip()) {
+                    Some(workload) => {
+                        let store = stores
+                            .lock()
+                            .expect("policy stores")
+                            .entry(workload.clone())
+                            .or_insert_with(|| dmesh_workload_policies(workload.clone()))
+                            .clone();
+                        inbound::policy::GetPolicy::get_policy(&store, dst)
+                    }
+                    None => inbound::policy::GetPolicy::get_policy(&p, dst),
+                }
+            })
+        };
+
+        // The inbound role of each DMA connection's HTTP service.
+        #[cfg(feature = "doca")]
+        let dmesh_http_wrap: dmesh::DmeshHttpWrap = {
+            let metrics = inbound_metrics.http_authz.clone();
+            std::sync::Arc::new(move |target, policy| {
+                inbound::fused::http_wrap(target.clone(), policy, metrics.clone())
+            })
         };
 
         // Keep a drain subscriber for the dmesh acceptor (spawned post-build).
@@ -366,6 +418,8 @@ impl Config {
             #[cfg(feature = "doca")]
             dmesh_policies,
             #[cfg(feature = "doca")]
+            dmesh_http_wrap,
+            #[cfg(feature = "doca")]
             dmesh_drain,
         })
     }
@@ -418,11 +472,12 @@ impl App {
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let outbound = self.dmesh_outbound.clone();
         let get_policy = self.dmesh_policies.clone();
+        let http_wrap = self.dmesh_http_wrap.clone();
         let shutdown = self.dmesh_drain.clone().signaled();
         dmesh_doca::backend::on_worker(worker, async move {
             // Factory runs after entering the shard runtime; caches are local.
             let outbound=outbound();
-            dmesh::serve(events,registrar,outbound,get_policy,shutdown).await;
+            dmesh::serve(events,registrar,outbound,get_policy,http_wrap,shutdown).await;
         }).instrument(info_span!("dmesh").or_current())
     }
 
