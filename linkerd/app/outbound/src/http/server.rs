@@ -27,7 +27,7 @@ impl<T> Outbound<svc::ArcNewCloneHttp<T>> {
         T: svc::Param<http::normalize_uri::DefaultAuthority> + 'static,
     {
         self.map_stack(|config, rt, http| {
-            http.check_new_service::<T, _>()
+            let http = http.check_new_service::<T, _>()
                 // Limit the number of in-flight outbound requests (across all
                 // targets).
                 //
@@ -55,7 +55,11 @@ impl<T> Outbound<svc::ArcNewCloneHttp<T>> {
                 .push(http::NewNormalizeUri::layer())
                 // Record when a HTTP/1 URI originated in absolute form
                 .push_on_service(http::normalize_uri::MarkAbsoluteForm::layer())
-                .arc_new_clone_http()
+                .arc_new_clone_http();
+            #[cfg(feature = "doca")]
+            let http = http.push(svc::layer::mk(super::dmesh_origin::NewRequestOrigin::new))
+                .arc_new_clone_http();
+            http
         })
     }
 }

@@ -10,6 +10,8 @@ use std::task::{Context, Poll};
 pub struct Connect {
     addr: Remote<ServerAddr>,
     tls: tls::ConditionalClientTls,
+    #[cfg(feature = "doca")]
+    origin: Option<dmesh_doca::PeerOrigin>,
 }
 
 /// Prevents outbound connections on the loopback interface, unless the
@@ -49,10 +51,7 @@ impl Outbound<()> {
 }
 
 #[cfg(feature = "doca")]
-impl<T> svc::Service<T> for DmeshOrTcp
-where
-    T: svc::Param<Remote<ServerAddr>>,
-{
+impl svc::Service<Connect> for DmeshOrTcp {
     type Response = (
         io::EitherIo<io::ScopedIo<tokio::net::TcpStream>, dmesh_doca::DmeshIo>,
         Local<ClientAddr>,
@@ -68,8 +67,18 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, ep: T) -> Self::Future {
-        let Remote(ServerAddr(addr)) = ep.param();
+    fn call(&mut self, ep: Connect) -> Self::Future {
+        let Remote(ServerAddr(addr)) = ep.addr;
+        if dmesh_doca::peer::is_remote(addr) {
+            let worker = self.1;
+            return Box::pin(async move {
+                let origin = ep.origin.ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied,
+                    "RDMA endpoint requires a verified source Pod"))?;
+                let dio = dmesh_doca::peer::connect(worker, addr, origin).await?;
+                let local = Local(ClientAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
+                Ok((io::EitherIo::Right(dio), local))
+            });
+        }
         if let Some(dio) = dmesh_doca::backend::take_on_worker(self.1, &addr) {
             tracing::info!(server.addr = %addr, "Connecting via dmesh DMA backend channel");
             let local = Local(ClientAddr(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
@@ -145,7 +154,10 @@ where
 
 impl Connect {
     pub fn new(addr: Remote<ServerAddr>, tls: tls::ConditionalClientTls) -> Self {
-        Self { addr, tls }
+        Self { addr, tls,
+            #[cfg(feature = "doca")]
+            origin: dmesh_doca::origin::current(),
+        }
     }
 }
 

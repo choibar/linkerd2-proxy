@@ -18,6 +18,10 @@ pub mod concrete;
 mod endpoint;
 #[cfg(feature = "doca")]
 mod dmesh_pool;
+#[cfg(feature = "doca")]
+mod dmesh_origin;
+#[cfg(feature = "doca")]
+mod dmesh_remote_pool;
 mod handle_proxy_error_headers;
 pub mod logical;
 mod require_id_header;
