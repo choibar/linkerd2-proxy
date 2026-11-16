@@ -406,11 +406,13 @@ int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
 	return DOCA_SUCCESS;
 }
 
-/* Update the DPU RX consumed position in this slot's DPA thread
- * (dpa_thread_ctx.rx_consumed_pos in TLS) so the kernel's staging gate can advance. Called
- * from the driver tick only after full segment consumption. Releases smaller
- * than DMESH_RX_CONSUMED_POS_BATCH are withheld to amortize the synchronous
- * h2d_memcpy; the gate still has room for a descriptor and a wrap's skipped tail. */
+/* Update the DPU RX consumed position the slot's DPA thread gates its staging
+ * on. Called from the driver tick only after full segment consumption. A mux
+ * flow's position is a store into ARM memory the DPA reads, made on every
+ * change. A pool thread's lives in its TLS (dpa_thread_ctx.rx_consumed_pos);
+ * releases smaller than DMESH_RX_CONSUMED_POS_BATCH are withheld to amortize
+ * the synchronous h2d_memcpy, and the gate still has room for a descriptor and
+ * a wrap's skipped tail. */
 #define DMESH_RX_CONSUMED_POS_BATCH (64u * 1024u)
 _Static_assert(DMESH_RX_CONSUMED_POS_BATCH + 2u * 8064u < BUFFER_SIZE,
                "consumed-position batching must leave room at the staging gate");
@@ -428,9 +430,9 @@ int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t
 	if (!conn->mux && (t == NULL || t->thread == NULL || t->local_storage == 0))
 		return DOCA_ERROR_BAD_STATE;
 	pos %= BUFFER_SIZE;
-	if ((pos + BUFFER_SIZE - conn->rx_consumed_pos_published) % BUFFER_SIZE < DMESH_RX_CONSUMED_POS_BATCH)
+	if (pos == conn->rx_consumed_pos_published ||
+	    (!conn->mux && (pos + BUFFER_SIZE - conn->rx_consumed_pos_published) % BUFFER_SIZE < DMESH_RX_CONSUMED_POS_BATCH))
 		return DOCA_SUCCESS;
-	/* A mux flow's position lives in its ring slot of the thread's state. */
 	if (conn->mux)
 		result = dmesh_dpa_mux_rx_consumed(conn, pos);
 	else
