@@ -18,19 +18,18 @@ allocator and release profile.
 ## Shape
 
 ```
-h2load ──TCP──▶ host bridge ──forward DMA──▶ ┌──────────────────────┐
-                (DMESH_BRIDGE_PORT)          │ dmesh-router (DPU)   │
-       ◀──TCP── host bridge ◀──reverse DMA── │  hyper h2 server     │
-                                             │      ↓ route(dst)    │
-nginx ◀─TCP─ host backend bridge ◀──push DMA─│  hyper client        │
-             (DMESH_BACKEND_CONNECT)         └──────────────────────┘
+h2load (host library) ──forward DMA──▶ ┌──────────────────────┐
+                                        │ dmesh-router (DPU)   │
+                      ◀──reverse DMA── │  hyper h2 server     │
+                                        │      ↓ route(dst)    │
+nginx (host library)  ◀──reverse DMA── │  hyper client        │
+                                        └──────────────────────┘
 ```
 
 A `DmeshEvent::ConnReady` carrying `is_backend` becomes a hyper *client* over
 that channel, registered under the flow's destination. Any other `ConnReady`
 becomes a hyper h2 *server*; each stream is routed to a registered channel.
-Both host bridges already exist in `apps/dma_bench/host/host_worker.c` — the router needs no
-C-side changes.
+The host side is the DPUMesh host library; the router needs no C-side changes.
 
 ## Configuration (environment only)
 
@@ -49,14 +48,14 @@ C-side changes.
 | `DMESH_BUSY_POLL` | *(unset)* | Read by the driver: poll the progress engines instead of sleeping |
 
 Routing order for a request: `DMESH_ROUTER_ROUTES[authority]` → the connection's
-flow destination (`DMESH_DST_IP`/`DMESH_DST_PORT` on the host bridge, the
+flow destination (the service address the host's flow carries, the
 `SO_ORIGINAL_DST` analogue) → `DMESH_ROUTER_DEFAULT_BACKEND`. No registered
 channel after the wait → `503`; a failed backend request → `502`.
 
 `http1` is the default because it matches what the proxy does today (the
 destination profile carries no `h2` protocol hint). One HTTP/1.1 channel carries
 one request at a time, so it becomes the bottleneck under concurrency — scale it
-by starting several host backend bridges under the same key (they round-robin),
+by running several backend processes for the same service (they round-robin),
 or use `h2`, where one channel multiplexes every stream.
 
 ## Measured (2026-08-12, testbed, 1 core, nginx on `127.0.0.1:8086`)
@@ -126,34 +125,17 @@ DPU:
 ./target/release/dmesh-router
 ```
 
-Host (`192.168.100.1`), **backend bridge first**, then the h2load ingress — each
-is a separate process, and each handles one connection then exits, so both are
-restarted per run:
-
-```bash
-cd ~/bf-workspace
-DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1        # nginx over DMA (DPA-free push path)
-
-DMESH_BRIDGE_PORT=8080 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1        # h2load ingress (needs host DPA on 94:00.0)
-
-h2load -c1 -m100 -n20000 http://127.0.0.1:8080/
-```
-
-`DMESH_DST_IP`/`DMESH_DST_PORT` must match between the two bridges: that shared
-value is the routing key. The ingress bridge opens a host DPA for the reverse
-path, `94:00.0` by default; if another tenant owns that function it fails with
-`flexio_create_prm_process ... Failed to create process`, and
-`DMESH_REV_PCI=94:00.1` (the same function the bridge already uses for comch)
-works instead — that is how the numbers above were measured.
+On the host (`192.168.100.1`), the backend and the load generator run over
+the DPUMesh host library: nginx under the preload façade with
+`DPUMESH_SERVICE` and `DPUMESH_PORT`, h2load under it with `DPUMESH_TARGETS`
+naming that service (DPUMesh `examples/README.md`, preload). The service's
+address is the routing key.
 
 The DPU process must be restarted between runs: tearing down a client
 connection currently segfaults the shared DOCA datapath (see CLAUDE.md
 gotchas), so `dmesh-router` exits when h2load disconnects.
 
-Latency probes already in the datapath: `[dmesh-lat] DPU-internal` (driver, DPU
-side) and `bridge: host-view RTT` (host side, printed when h2load disconnects).
+Latency probe in the datapath: `[dmesh-lat] DPU-internal` (driver, DPU side).
 
 ## Tests
 
