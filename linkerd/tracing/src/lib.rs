@@ -180,6 +180,31 @@ impl Settings {
         Ok(handle)
     }
 
+    /// Build an independent subscriber for a worker's thread-local dispatch.
+    /// Unlike `init`, this installs neither a global subscriber nor a log bridge.
+    pub fn build_scoped(self) -> (Dispatch, Handle) {
+        if !self.filter.trim().eq_ignore_ascii_case("off") {
+            return self.build();
+        }
+
+        #[cfg(feature = "stream")]
+        {
+            let (stream, layer) = stream::StreamHandle::new();
+            let dispatch = tracing_subscriber::registry().with(None).with(layer).into();
+            (
+                dispatch,
+                Handle {
+                    level: None,
+                    stream,
+                },
+            )
+        }
+        #[cfg(not(feature = "stream"))]
+        {
+            (Dispatch::none(), Handle::disabled())
+        }
+    }
+
     /// Builds a tracing subscriber dispatcher and a handle that can control
     /// logging behavior at runtime (e.g., from an admin server).
     ///

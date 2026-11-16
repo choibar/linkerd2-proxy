@@ -122,6 +122,28 @@ pub struct EndpointRef(Arc<policy::Meta>);
 // === impl Outbound ===
 
 impl Outbound<()> {
+    /// Create private datapath stores before building a worker's stacks, and
+    /// register their reports for scrape-time aggregation. Identity, control
+    /// clients and drain state keep their original owners.
+    pub fn with_worker_metrics(
+        mut self,
+        retain_idle: Duration,
+        reports: &metrics::legacy::Aggregate,
+    ) -> Self {
+        use metrics::legacy::FmtMetrics as _;
+
+        let (metrics, report) = metrics::Metrics::new(retain_idle);
+        let mut registry = prom::Registry::default();
+        self.runtime.metrics =
+            OutboundMetrics::new(metrics.proxy, registry.sub_registry_with_prefix("outbound"));
+        reports.register(
+            self.metrics()
+                .and_report(report)
+                .and_report(prom::Report::from(registry)),
+        );
+        self
+    }
+
     pub fn new(config: Config, runtime: ProxyRuntime, prom: &mut prom::Registry) -> Self {
         let runtime = Runtime {
             metrics: OutboundMetrics::new(runtime.metrics, prom),
@@ -368,4 +390,87 @@ pub(crate) fn service_meta(addr: &NameAddr) -> Option<Arc<policy::Meta>> {
         section: None,
         port: Some(addr.port().try_into().ok()?),
     }))
+}
+
+#[cfg(test)]
+mod worker_metrics_tests {
+    use super::*;
+    use metrics::legacy::{Aggregate, FmtMetrics};
+    use svc::stack::MonitorError;
+
+    fn record(out: &Outbound<()>, count: u64) {
+        let mut errors = out.runtime.metrics.http_errors.clone();
+        for _ in 0..count {
+            errors.monitor_error(&Error::from("worker test"));
+        }
+        let zone = out.runtime.metrics.prom.zone.metrics(zone::tcp_zone_labels(
+            metrics::OutboundZoneLocality::Unknown,
+        ));
+        zone.recv_bytes.inc_by(count);
+    }
+
+    #[tokio::test]
+    async fn workers_replace_cloned_stores_and_scrape_with_primary_metrics() {
+        let retain_idle = Duration::from_secs(60);
+        let (mut runtime, _drain) = test_util::runtime();
+        let (metrics, legacy) = metrics::Metrics::new(retain_idle);
+        runtime.metrics = metrics.proxy;
+        let mut registry = prom::Registry::default();
+        let primary = Outbound::new(
+            test_util::default_config(),
+            runtime,
+            registry.sub_registry_with_prefix("outbound"),
+        );
+        let reports = Aggregate::default();
+        let a = primary.clone().with_worker_metrics(retain_idle, &reports);
+        let b = primary.clone().with_worker_metrics(retain_idle, &reports);
+        record(&primary, 1);
+        record(&a, 2);
+        record(&b, 3);
+
+        let base_report = primary
+            .metrics()
+            .and_report(legacy)
+            .and_report(prom::Report::from(registry));
+        let combined = reports.with_primary(base_report.clone(), true);
+        let output = combined.as_display().to_string();
+        assert!(output.contains("outbound_http_errors_total{error=\"unexpected\"} 6\n"));
+        assert!(output.lines().any(|line| line
+            .starts_with("outbound_tcp_transfer_cost_bytes_total{")
+            && line.ends_with(" 6")));
+        assert_eq!(
+            output
+                .matches("# TYPE outbound_tcp_transfer_cost_bytes counter")
+                .count(),
+            1
+        );
+        assert_eq!(output.matches("# EOF").count(), 1);
+        assert_eq!(combined.as_display().to_string(), output);
+
+        record(&a, 4);
+        assert!(b
+            .metrics()
+            .as_display()
+            .to_string()
+            .contains("outbound_http_errors_total{error=\"unexpected\"} 3\n"));
+        assert!(base_report
+            .as_display()
+            .to_string()
+            .contains("outbound_http_errors_total{error=\"unexpected\"} 1\n"));
+        assert!(combined
+            .as_display()
+            .to_string()
+            .contains("outbound_http_errors_total{error=\"unexpected\"} 10\n"));
+        let zone = b.runtime.metrics.prom.zone.metrics(zone::tcp_zone_labels(
+            metrics::OutboundZoneLocality::Unknown,
+        ));
+        assert_eq!(zone.recv_bytes.get(), 3);
+
+        // Shared mode retains its existing exposition byte for byte.
+        let shared = reports.with_primary(base_report.clone(), false);
+        assert_eq!(
+            shared.as_display().to_string(),
+            base_report.as_display().to_string()
+        );
+    }
 }

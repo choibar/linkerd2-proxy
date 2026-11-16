@@ -148,6 +148,80 @@ impl ClassMetrics {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn worker_reports_merge_live_request_counts_and_latency_histograms() {
+        use super::*;
+        use linkerd_metrics::legacy::{Aggregate, FmtLabels};
+        use std::fmt;
+
+        #[derive(Clone, Debug, Hash, Eq, PartialEq)]
+        struct Label;
+        impl FmtLabels for Label {
+            fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("target=\"same\"")
+            }
+        }
+
+        #[derive(Clone, Debug, Hash, Eq, PartialEq)]
+        struct Class;
+        impl FmtLabels for Class {
+            fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("class=\"success\"")
+            }
+        }
+
+        let reports = Aggregate::default();
+        let mut stores = Vec::new();
+        for count in [2, 3] {
+            let requests = Requests::<Label, Class>::default();
+            let metrics = requests.0.lock().entry(Label).or_default().clone();
+            {
+                let mut metrics = metrics.lock();
+                metrics.total.add(count);
+                let status = metrics
+                    .by_status
+                    .entry(Some(http::StatusCode::OK))
+                    .or_default();
+                for _ in 0..count {
+                    status.latency.add(Duration::from_millis(2));
+                }
+                status.by_class.entry(Class).or_default().total.add(count);
+            }
+            let report = requests.into_report(Duration::from_secs(60));
+            reports.register(report.clone());
+            stores.push((metrics, report));
+        }
+        // The primary registry and worker registries use the same legacy
+        // encoder as the admin endpoint, including cumulative buckets.
+        let primary = Requests::<Label, Class>::default().into_report(Duration::from_secs(60));
+        let combined = reports.with_primary(primary, true);
+        let output = combined.as_display().to_string();
+        assert!(output.contains("request_total{target=\"same\"} 5\n"));
+        assert!(output
+            .contains("response_total{class=\"success\",status_code=\"200\",target=\"same\"} 5\n"));
+        assert!(output.contains(
+            "response_latency_ms_bucket{le=\"2\",status_code=\"200\",target=\"same\"} 5\n"
+        ));
+        assert!(
+            output.contains("response_latency_ms_count{status_code=\"200\",target=\"same\"} 5\n")
+        );
+        assert!(
+            output.contains("response_latency_ms_sum{status_code=\"200\",target=\"same\"} 10\n")
+        );
+        assert_eq!(output.matches("# TYPE request_total counter").count(), 1);
+        assert_eq!(combined.as_display().to_string(), output);
+        stores[0].0.lock().total.incr();
+        assert!(stores[1]
+            .1
+            .as_display()
+            .to_string()
+            .contains("request_total{target=\"same\"} 3\n"));
+        assert!(combined
+            .as_display()
+            .to_string()
+            .contains("request_total{target=\"same\"} 6\n"));
+    }
+
+    #[test]
     fn expiry() {
         use linkerd_metrics::legacy::FmtLabels;
         use std::fmt;

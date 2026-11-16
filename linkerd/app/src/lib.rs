@@ -66,6 +66,9 @@ pub struct Config {
     pub tap: tap::Config,
     pub trace_collector: trace_collector::Config,
 
+    /// Ownership of sharded datapath metrics, coupled to tracing's scope.
+    pub worker_scope: metrics::WorkerScope,
+
     /// Grace period for graceful shutdowns.
     ///
     /// If the proxy does not shut down gracefully within this timeout, it will
@@ -99,6 +102,11 @@ impl Config {
         env::Env.try_config()
     }
 
+    pub fn with_worker_scope(mut self, scope: metrics::WorkerScope) -> Self {
+        self.worker_scope = scope;
+        self
+    }
+
     /// Build an application.
     ///
     /// It is currently required that this be run on a Tokio runtime, since some
@@ -126,6 +134,8 @@ impl Config {
         BAdmin: Bind<ServerConfig, BoundAddrs = Local<ServerAddr>> + Clone + 'static,
         BAdmin::Addrs: Param<Remote<ClientAddr>> + Param<Local<ServerAddr>> + Param<AddrPair>,
     {
+        let worker_metrics = self.worker_scope == metrics::WorkerScope::Worker;
+        let worker_reports = metrics::legacy::Aggregate::default();
         let Config {
             admin,
             dns,
@@ -281,9 +291,20 @@ impl Config {
         let dmesh_outbound: std::sync::Arc<dyn Fn() -> svc::ArcNewTcp<dmesh::DmeshTarget, dmesh_doca::DmeshIo> + Send + Sync> = {
             let out=outbound.clone();
             let profiles=dst.profiles.clone(); let policies=outbound_policies.clone(); let resolve=dst.resolve.clone();
+            let reports = worker_reports.clone();
+            let retain_idle = admin.metrics_retain_idle;
             // Pools/connectors capture this stack's logical worker. Sharing
             // stacks would merge workers again even on a multi-thread runtime.
-            std::sync::Arc::new(move || out.clone().mk(profiles.clone(),policies.clone(),resolve.clone()))
+            std::sync::Arc::new(move || {
+                let out = if worker_metrics {
+                    // Construct fresh legacy stores AND Prometheus families;
+                    // cloning the existing metrics would retain shared locks.
+                    out.clone().with_worker_metrics(retain_idle, &reports)
+                } else {
+                    out.clone()
+                };
+                out.mk(profiles.clone(), policies.clone(), resolve.clone())
+            })
         };
         let outbound = outbound.mk(dst.profiles.clone(), outbound_policies, dst.resolve.clone());
 
@@ -336,6 +357,7 @@ impl Config {
                 // The prom registry reports an "# EOF" at the end of its export, so
                 // it should be emitted last.
                 .and_report(prom::Report::from(registry));
+            let report = worker_reports.with_primary(report, worker_metrics);
             info_span!("admin").in_scope(move || {
                 admin.build(
                     bind_admin,
