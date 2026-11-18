@@ -239,7 +239,9 @@ where
     }
 }
 
-/// Inline-streams selection, read once at startup (`DMESH_INLINE_STREAMS=1`).
+/// Inline-streams selection, read once at startup: on unless
+/// `DMESH_INLINE_STREAMS=0`. It applies to every HTTP/2 server connection of
+/// the proxy, DMA or TCP.
 ///
 /// In this mode hyper's h2 server keeps each stream's request/response future
 /// in a set owned by the connection and polls it after the connection's I/O,
@@ -262,9 +264,11 @@ fn inline_streams() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("DMESH_INLINE_STREAMS").is_some();
+        let on = std::env::var("DMESH_INLINE_STREAMS").map(|v| v != "0").unwrap_or(true);
         if on {
             tracing::info!("HTTP/2 server: inline streams (no task per stream)");
+        } else {
+            tracing::info!("HTTP/2 server: one task per stream");
         }
         on
     })
