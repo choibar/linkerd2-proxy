@@ -71,7 +71,6 @@ extern "C" {
     ) -> c_int;
     // Update the DPA's consumed position to return DPU RX staging space.
     fn dmesh_doca_conn_update_dpu_rx_consumed_pos(objs: *mut c_void, slot: i32, pos: u32) -> i32;
-    fn dmesh_doca_conn_recv_release(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> c_int;
     // Flow mode of a slot: 0 = client, 1 = backend provider.
     fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
     // Report the connection's mapped tx_staging region (usable base + len) so

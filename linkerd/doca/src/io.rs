@@ -116,6 +116,7 @@ mod seg_cache {
             return;
         }
         static N: AtomicU64 = AtomicU64::new(0);
+        #[cfg(target_arch = "aarch64")]
         static TICKS: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Relaxed);
         if n % 64 != 0 {
