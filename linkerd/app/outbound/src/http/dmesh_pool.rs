@@ -67,7 +67,7 @@ where
         if !dmesh_doca::backend::is_dma(&address) || !matches!(params, http::client::Params::H2(_))
         {
             if matches!(params, http::client::Params::H2(_))
-                && std::env::var_os("DPUMESH_PEER_TRANSPORT").is_some_and(|v| !v.is_empty())
+                && std::env::var_os("DPUMESH_PEER_RDMA_DEVICE").is_some_and(|v| !v.is_empty())
             {
                 return super::dmesh_remote_pool::unclassified(self.0.clone(), target, self.1);
             }

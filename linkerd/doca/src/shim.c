@@ -664,7 +664,7 @@ void dmesh_doca_comch_destroy(struct objects *handle)
 		return;
 
     if (peer_node_worker_stop(handle->peer_worker)) {
-        fprintf(stderr, "[DMesh] retaining worker with live peer streams/DMA\n");
+        fprintf(stderr, "[DMesh] retaining worker with live peer connections/DMA\n");
         return;
     }
 
@@ -700,13 +700,13 @@ void dmesh_doca_comch_destroy(struct objects *handle)
 
 /* Existing Comch names remain control aliases. Each data worker opens its own
  * device reference and never owns a Comch server/control PE. */
-static int peer_group_start(struct peer_session_control *control, struct objects **workers,
+static int peer_group_start(struct local_control_session *local_control, struct objects **workers,
                              size_t count, void **out)
 {
     struct doca_dev *devices[128];
     for (size_t i = 0; i < count; ++i) devices[i] = workers[i]->dev;
     struct peer_node *node = NULL;
-    int error = peer_node_new(control, devices, (unsigned)count,
+    int error = peer_node_new(local_control, devices, (unsigned)count,
                               dmesh_dispatch_listener_live, &node);
     *out = node;
     if (!error)

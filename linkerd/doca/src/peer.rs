@@ -1,4 +1,4 @@
-//! Worker-owned RDMA stream adapter. Only control requests cross the channel;
+//! Worker-owned RDMA connection adapter. Only control requests cross the channel;
 //! L7 reads RX staging and writes registered TX arena chunks through DmeshIo.
 use crate::{
     origin::WireOrigin, DmeshIo, DmeshIoHandle, FlowId, FlowKey, FlowLocation, PeerOrigin,
@@ -31,21 +31,21 @@ struct Info {
 }
 extern "C" {
     fn dmesh_doca_peer_worker(objects: *mut c_void) -> *mut c_void;
-    fn peer_node_streams(worker: *mut c_void) -> *mut c_void;
+    fn peer_node_connections(worker: *mut c_void) -> *mut c_void;
     fn peer_node_worker_progress(worker: *mut c_void) -> i32;
     fn peer_node_worker_fds(worker: *mut c_void, carrier: *mut i32, msgq: *mut i32) -> i32;
     fn peer_node_worker_arm(worker: *mut c_void) -> i32;
     fn peer_node_worker_disarm(worker: *mut c_void) -> i32;
     fn peer_node_remote(ip: u32, port: u16) -> i32;
-    fn peer_stream_open(
+    fn peer_connection_open(
         w: *mut c_void,
         origin: *const WireOrigin,
         ip: u32,
         port: u16,
         token: *mut u32,
     ) -> i32;
-    fn peer_stream_next(w: *mut c_void, cursor: *mut u32, info: *mut Info) -> i32;
-    fn peer_stream_buffers(
+    fn peer_connection_next(w: *mut c_void, cursor: *mut u32, info: *mut Info) -> i32;
+    fn peer_connection_buffers(
         w: *mut c_void,
         token: u32,
         tx: *mut *mut c_void,
@@ -53,24 +53,24 @@ extern "C" {
         rx: *mut *mut c_void,
         rx_bytes: *mut usize,
     ) -> i32;
-    fn peer_stream_tx_acquire(
+    fn peer_connection_tx_acquire(
         w: *mut c_void,
         token: u32,
         chunk: *mut u32,
         data: *mut *mut c_void,
         capacity: *mut usize,
     ) -> i32;
-    fn peer_stream_receive(w: *mut c_void, token: u32, pos: *mut u32, bytes: *mut u32) -> i32;
-    fn peer_stream_consumed(w: *mut c_void, token: u32, pos: u32) -> i32;
-    fn peer_stream_send(w: *mut c_void, token: u32, chunk: u32, bytes: u32) -> i32;
-    fn peer_stream_completed(w: *mut c_void, token: u32, bytes: *mut u64) -> i32;
-    fn peer_stream_fin(w: *mut c_void, token: u32) -> i32;
-    fn peer_stream_detach(w: *mut c_void, token: u32) -> i32;
+    fn peer_connection_receive(w: *mut c_void, token: u32, pos: *mut u32, bytes: *mut u32) -> i32;
+    fn peer_connection_consumed(w: *mut c_void, token: u32, pos: u32) -> i32;
+    fn peer_connection_send(w: *mut c_void, token: u32, chunk: u32, bytes: u32) -> i32;
+    fn peer_connection_completed(w: *mut c_void, token: u32, bytes: *mut u64) -> i32;
+    fn peer_connection_fin(w: *mut c_void, token: u32) -> i32;
+    fn peer_connection_detach(w: *mut c_void, token: u32) -> i32;
 }
 fn unavailable() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionRefused,
-        "authenticated RDMA stream unavailable",
+        "authenticated RDMA connection unavailable",
     )
 }
 struct Request {
@@ -86,7 +86,7 @@ fn requesters() -> &'static Mutex<HashMap<usize, Requester>> {
     static R: OnceLock<Mutex<HashMap<usize, Requester>>> = OnceLock::new();
     R.get_or_init(Default::default)
 }
-/// An incoming authenticated stream still goes through receiving Linkerd L7
+/// An incoming authenticated connection still goes through receiving Linkerd L7
 /// authorization. The Host backend is not exposed directly to an RDMA peer.
 pub struct Incoming {
     pub flow: FlowId,
@@ -138,7 +138,7 @@ pub async fn connect(
     wake.notify_one();
     tokio::time::timeout(std::time::Duration::from_secs(30), rx)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "RDMA stream OPEN timed out"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "RDMA connection OPEN timed out"))?
         .map_err(|_| unavailable())?
 }
 
@@ -150,7 +150,7 @@ struct Entry {
 }
 pub(crate) struct PeerDriver {
     worker: *mut c_void,
-    streams: *mut c_void,
+    connections: *mut c_void,
     id: usize,
     requests: mpsc::Receiver<Request>,
     pending: HashMap<u32, oneshot::Sender<io::Result<DmeshIo>>>,
@@ -165,7 +165,7 @@ impl PeerDriver {
         if worker.is_null() {
             return None;
         }
-        let streams = peer_node_streams(worker);
+        let connections = peer_node_connections(worker);
         let (tx, requests) = mpsc::channel(64);
         let wake = Arc::new(Notify::new());
         requesters().lock().unwrap().insert(
@@ -177,7 +177,7 @@ impl PeerDriver {
         );
         Some(Self {
             worker,
-            streams,
+            connections,
             id,
             requests,
             pending: HashMap::new(),
@@ -218,8 +218,8 @@ impl PeerDriver {
         let (mut tx, mut rx) = (std::ptr::null_mut(), std::ptr::null_mut());
         let (mut tx_bytes, mut rx_bytes) = (0, 0);
         if unsafe {
-            peer_stream_buffers(
-                self.streams,
+            peer_connection_buffers(
+                self.connections,
                 info.token,
                 &mut tx,
                 &mut tx_bytes,
@@ -254,7 +254,7 @@ impl PeerDriver {
         if let Some(reply) = self.pending.remove(&token) {
             let _ = reply.send(Err(unavailable()));
         }
-        unsafe { peer_stream_detach(self.streams, token) == 1 }
+        unsafe { peer_connection_detach(self.connections, token) == 1 }
     }
     pub(crate) fn progress(&mut self) -> io::Result<()> {
         while let Ok(request) = self.requests.try_recv() {
@@ -267,8 +267,8 @@ impl PeerDriver {
             };
             let mut token = 0;
             let rc = unsafe {
-                peer_stream_open(
-                    self.streams,
+                peer_connection_open(
+                    self.connections,
                     &origin,
                     u32::from_ne_bytes(request.address.ip().octets()),
                     request.address.port(),
@@ -287,7 +287,7 @@ impl PeerDriver {
         let mut cursor = 0;
         loop {
             let mut info: Info = unsafe { std::mem::zeroed() };
-            if unsafe { peer_stream_next(self.streams, &mut cursor, &mut info) } != 1 {
+            if unsafe { peer_connection_next(self.connections, &mut cursor, &mut info) } != 1 {
                 break;
             }
             if info.state == 3 || self.pending.get(&info.token).is_some_and(|r| r.is_closed()) {
@@ -353,19 +353,19 @@ impl PeerDriver {
                 }
             }
             let mut completed = 0;
-            if unsafe { peer_stream_completed(self.streams, info.token, &mut completed) } == 0 {
+            if unsafe { peer_connection_completed(self.connections, info.token, &mut completed) } == 0 {
                 entry.handle.advance_completed(completed)?;
             }
             if let Some(pos) = entry.handle.get_dpu_rx_consumed_pos() {
-                if unsafe { peer_stream_consumed(self.streams, info.token, pos) } != 0 {
+                if unsafe { peer_connection_consumed(self.connections, info.token, pos) } != 0 {
                     return Err(unavailable());
                 }
             }
             while entry.handle.wants_tx_chunk() {
                 let (mut chunk, mut data, mut capacity) = (0, std::ptr::null_mut(), 0);
                 let rc = unsafe {
-                    peer_stream_tx_acquire(
-                        self.streams,
+                    peer_connection_tx_acquire(
+                        self.connections,
                         info.token,
                         &mut chunk,
                         &mut data,
@@ -383,7 +383,7 @@ impl PeerDriver {
             for _ in 0..32 {
                 let (mut pos, mut bytes) = (0, 0);
                 let rc =
-                    unsafe { peer_stream_receive(self.streams, info.token, &mut pos, &mut bytes) };
+                    unsafe { peer_connection_receive(self.connections, info.token, &mut pos, &mut bytes) };
                 if rc == -libc::ENODATA {
                     entry.handle.close_rx();
                     break;
@@ -397,14 +397,14 @@ impl PeerDriver {
                 let Some((chunk, bytes)) = entry.handle.take_staged() else {
                     break;
                 };
-                let sent = unsafe { peer_stream_send(self.streams, info.token, chunk, bytes) };
+                let sent = unsafe { peer_connection_send(self.connections, info.token, chunk, bytes) };
                 if sent <= 0 {
                     break;
                 }
                 entry.handle.advance_publish(sent as u32);
             }
             entry.fin_pending |= entry.handle.take_fin();
-            if entry.fin_pending && unsafe { peer_stream_fin(self.streams, info.token) } == 0 {
+            if entry.fin_pending && unsafe { peer_connection_fin(self.connections, info.token) } == 0 {
                 entry.fin_pending = false;
             }
         }
