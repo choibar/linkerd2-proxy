@@ -76,6 +76,41 @@ targets are especially important:
 [`linkerd2-app-inbound`]: linkerd/app/inbound
 [`linkerd2-app-outbound`]: linkerd/app/outbound
 
+## DPUMesh worker observability
+
+`DPUMESH_L7_TRACE_SCOPE` selects ownership of both tracing subscribers and
+datapath metrics. The existing option name is retained for compatibility.
+
+| Configuration | Tracing subscriber | Datapath metrics |
+| --- | --- | --- |
+| `DMESH_SHARDED=1 DPUMESH_L7_TRACE_SCOPE=worker` | Independent per worker | Independent per worker; combined during `/metrics` scrapes |
+| `DMESH_SHARDED=1 DPUMESH_L7_TRACE_SCOPE=shared` | Shared | Shared |
+
+With `DMESH_SHARDED` set, the default scope is `worker`; otherwise it is
+`shared`. Explicit `worker` scope requires `DMESH_SHARDED`. As with the
+existing sharded runtime option, presence of `DMESH_SHARDED` enables it.
+`DMESH_TOKIO_CONSOLE` forces shared scope when console support is compiled in.
+
+Worker scope creates new legacy HTTP/transport/stack/error metric stores and
+new Prometheus metric families before constructing each worker's outbound
+stack. Cloning a stack within a worker shares only that worker's stores.
+Control clients, identity, ordinary TCP listeners, and process/runtime metrics
+keep their existing ownership.
+
+The admin endpoint combines its primary report with the worker reports only
+when scraped. Matching metric names and label sets produce one series:
+counters and additive gauges are summed, and histograms combine corresponding
+buckets, counts, and sums. Names and labels are preserved without adding a
+worker label. HELP/TYPE metadata and the final EOF marker are emitted once.
+The report-list lock is used during registration and scrape snapshots, never
+when recording a request. Scraping still takes each registry's normal locks.
+Repeated scrapes do not accumulate totals. Idle-series retention continues to
+apply independently within each registry.
+
+Worker reports remain registered for the app's lifetime, including after a
+worker exits. Conflicting types/bucket boundaries or overlapping summary
+quantiles fail formatting rather than returning an invalid aggregate.
+
 ## Code of conduct
 
 This project is for everyone. We ask that our users and contributors take a few
