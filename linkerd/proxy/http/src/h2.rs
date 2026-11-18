@@ -126,10 +126,13 @@ where
                     builder.max_send_buf_size(sz);
                 }
 
-                let (tx, conn) = builder
+                let (mut tx, mut conn) = builder
                     .handshake(hyper_util::rt::TokioIo::new(io))
                     .instrument(trace_span!("handshake").or_current())
                     .await?;
+                if direct_send() {
+                    conn.direct_send(&mut tx);
+                }
 
                 tokio::spawn(
                     conn.map_err(|error| debug!(%error, "failed"))
@@ -143,11 +146,31 @@ where
     }
 }
 
+/// Direct-send selection, read once at startup: on unless
+/// `DMESH_H2_CLIENT_DIRECT=0`. A request then enters the HTTP/2 connection in
+/// the task that calls the client, which also waits for its response, where
+/// hyper otherwise passes it to a dispatch task and spawns two tasks per
+/// request. It applies to every HTTP/2 client connection of the proxy.
+fn direct_send() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("DMESH_H2_CLIENT_DIRECT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if on {
+            tracing::info!("HTTP/2 client: direct send (no task per request)");
+        } else {
+            tracing::info!("HTTP/2 client: requests through the dispatch task");
+        }
+        on
+    })
+}
+
 // === impl Connection ===
 
 impl<B> tower::Service<http::Request<B>> for Connection<B>
 where
-    B: Body + Send + 'static,
+    B: Body + Send + Unpin + 'static,
     B::Data: Send,
     B::Error: Into<Error> + Send + Sync,
 {
@@ -178,3 +201,6 @@ where
         self.tx.send_request(req).boxed()
     }
 }
+
+#[cfg(test)]
+mod tests;

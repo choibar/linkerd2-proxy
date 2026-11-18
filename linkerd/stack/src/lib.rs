@@ -49,7 +49,9 @@ pub use self::{
     new_service::{NewCloneService, NewFromTargets, NewFromTargetsInner, NewService},
     on_service::{OnService, OnServiceLayer},
     proxy::Proxy,
-    queue::{NewQueue, NewQueueWithoutTimeout, Queue, QueueWithoutTimeout},
+    queue::{
+        DirectQueue, NewDirectQueue, NewQueue, NewQueueWithoutTimeout, Queue, QueueWithoutTimeout,
+    },
     result::ResultService,
     switch_ready::{NewSwitchReady, SwitchReady},
     thunk::{NewThunk, Thunk, ThunkClone},

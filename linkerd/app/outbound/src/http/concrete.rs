@@ -98,16 +98,20 @@ impl<N> Outbound<N> {
             // TODO(ver) Configure this from discovery.
             let queue = config.http_request_queue;
 
-            let forward = inner
-                .clone()
-                .push_on_service(
-                    rt.metrics
-                        .proxy
-                        .stack
-                        .layer(stack_labels("http", "forward")),
-                )
-                .push(svc::NewQueue::layer())
-                .instrument(|e: &Endpoint<T>| info_span!("forward", addr = %e.addr));
+            let forward = inner.clone().push_on_service(
+                rt.metrics
+                    .proxy
+                    .stack
+                    .layer(stack_labels("http", "forward")),
+            );
+            // A DMA endpoint's transport is owned by the calling worker, so
+            // its requests need not hop through the queue's task.
+            #[cfg(feature = "doca")]
+            let forward = forward.push(svc::NewDirectQueue::layer());
+            #[cfg(not(feature = "doca"))]
+            let forward = forward.push(svc::NewQueue::layer());
+            let forward =
+                forward.instrument(|e: &Endpoint<T>| info_span!("forward", addr = %e.addr));
 
             let fail = svc::ArcNewService::new(|message: Arc<str>| {
                 svc::mk(move |_| futures::future::ready(Err(DispatcherFailed(message.clone()))))
@@ -173,6 +177,18 @@ impl<T> svc::Param<svc::queue::Capacity> for Endpoint<T> {
 impl<T> svc::Param<svc::queue::Timeout> for Endpoint<T> {
     fn param(&self) -> svc::queue::Timeout {
         svc::queue::Timeout(self.queue.failfast_timeout)
+    }
+}
+
+/// `DMESH_QUEUE_DIRECT=0` keeps DMA endpoints on the queue's worker task.
+#[cfg(feature = "doca")]
+impl<T> svc::Param<svc::queue::Direct> for Endpoint<T> {
+    fn param(&self) -> svc::queue::Direct {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED
+            .get_or_init(|| std::env::var("DMESH_QUEUE_DIRECT").map_or(true, |v| v != "0"));
+        let Remote(ServerAddr(addr)) = self.addr;
+        svc::queue::Direct(enabled && dmesh_doca::backend::is_dma(&addr))
     }
 }
 

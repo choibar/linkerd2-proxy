@@ -71,7 +71,7 @@ extern "C" {
     ) -> c_int;
     // Update the DPA's consumed position to return DPU RX staging space.
     fn dmesh_doca_conn_update_dpu_rx_consumed_pos(objs: *mut c_void, slot: i32, pos: u32) -> i32;
-    // Flow mode of a slot: 0 = client, 1 = backend provider.
+    // Flow mode of a slot: 1 = backend provider, otherwise a client flow.
     fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
     // Report the connection's mapped tx_staging region (usable base + len) so
     // the writer stages response bytes in place. Negative doca_error_t until
@@ -105,6 +105,8 @@ extern "C" {
 /// Global init state (mirrors `enum dmesh_doca_init_state` in comch_server.h)
 const STATE_ERROR: c_int = -1;
 const STATE_RUNNING: c_int = 1;
+/// `dmesh_doca_conn_recv_pop` at end of stream: the host closed its sending half.
+const DOCA_ERROR_SHUTDOWN: c_int = 10;
 
 /// Per-connection state (mirrors `enum dmesh_conn_state` in object.h)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,6 +379,9 @@ impl Driver {
                     dmesh_doca_conn_recv_pop(self.doca.raw(), slot as i32, &mut pos, &mut len)
                 };
                 if rc != 0 {
+                    if rc == DOCA_ERROR_SHUTDOWN {
+                        handle.close_rx();
+                    }
                     break; // DOCA_ERROR_EMPTY or error
                 }
                 if self.t_in.is_none() {
@@ -734,19 +739,22 @@ impl Driver {
         let mut stats_last = Instant::now();
         let mut stats_prev = self.stats();
 
-        // DMESH_BUSY_POLL=1 polls both progress engines in a tight loop instead
-        // of sleeping on their notification fds. Profiling the datapath showed
-        // epoll_pwait taking >50% of the core at saturation: with a request/
-        // response workload each wakeup carries only a message or two, so the
-        // per-wakeup cost (epoll round-trip + PE re-arm) is paid per message
-        // rather than amortized over a batch. Busy-polling trades an always-hot
-        // core for removing that cost. (Mirrors DPUMESH_BUSY_POLL in the C
-        // worker, dpu_worker.c.)
+        // Busy-poll is the default: both progress engines are polled in a tight
+        // loop instead of sleeping on their notification fds. Profiling the
+        // datapath showed epoll_pwait taking >50% of the core at saturation:
+        // with a request/response workload each wakeup carries only a message
+        // or two, so the per-wakeup cost (epoll round-trip + PE re-arm) is paid
+        // per message rather than amortized over a batch. Busy-polling trades
+        // an always-hot core for removing that cost. DMESH_BUSY_POLL=0 selects
+        // the event-driven loop, which sleeps when idle. (The C worker,
+        // dpu_worker.c, reads the same variable but defaults to event-driven.)
         let busy_poll = std::env::var("DMESH_BUSY_POLL")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
         if busy_poll {
             tracing::info!("dmesh driver: busy-poll mode (progress engines polled, fds unused)");
+        } else {
+            tracing::info!("dmesh driver: event-driven mode (DMESH_BUSY_POLL=0)");
         }
 
         loop {

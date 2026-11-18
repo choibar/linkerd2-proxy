@@ -2,7 +2,7 @@
 //! Route filters/identity checks/metrics stay outside this transport-only layer.
 use linkerd_app_core::{
     proxy::http,
-    svc::{self, NewService, Param, Service, ServiceExt},
+    svc::{self, NewService, Param, Service},
     tls,
     transport::{Remote, ServerAddr},
     Error,
@@ -12,13 +12,17 @@ use std::{
     future::Future,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex, OnceLock, Weak},
-    task::{Context, Poll},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
+    task::{Context, Poll, Waker},
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
 
 type Response = http::Response<http::BoxBody>;
+type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
 struct Message {
     source_worker: usize,
     source_thread: std::thread::ThreadId,
@@ -34,7 +38,82 @@ struct Key {
 }
 struct Pool {
     worker: usize,
+    address: SocketAddr,
     sender: mpsc::Sender<Message>,
+    shared: Arc<parking_lot::Mutex<Shared>>,
+}
+/// The owner's transport, shared with its routing handles so that a caller on
+/// the owner's thread dispatches on its own stack instead of through the owner.
+struct Shared {
+    service: Option<svc::BoxHttp>,
+    /// Set while the owner is idle and the transport last reported ready. A
+    /// caller's readiness probe carries no waker, so it must never replace one
+    /// the owner is waiting on: the owner clears this before it polls.
+    direct: bool,
+    /// The owner's thread when it runs on a current-thread runtime, else 0.
+    thread: usize,
+    live: Arc<AtomicBool>,
+    requests: u64,
+}
+impl Shared {
+    fn new() -> Arc<parking_lot::Mutex<Self>> {
+        Arc::new(parking_lot::Mutex::new(Self {
+            service: None,
+            direct: false,
+            thread: 0,
+            live: Arc::new(AtomicBool::new(false)),
+            requests: 0,
+        }))
+    }
+    fn close(&mut self) {
+        self.service = None;
+        self.direct = false;
+    }
+}
+impl Pool {
+    /// Dispatches on the caller's stack when the transport is ready and owned
+    /// by this thread; otherwise hands the request back for the owner's queue.
+    fn direct(
+        &self,
+        request: http::Request<http::BoxBody>,
+    ) -> Result<ResponseFuture, http::Request<http::BoxBody>> {
+        let mut shared = self.shared.lock();
+        if !shared.direct
+            || shared.thread != thread_token()
+            || !shared.live.load(Ordering::Acquire)
+            || !dmesh_doca::backend::endpoint_enabled(self.address)
+        {
+            return Err(request);
+        }
+        let Some(svc) = shared.service.as_mut() else {
+            return Err(request);
+        };
+        match svc.poll_ready(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Ok(())) => {
+                let future = svc.call(request);
+                shared.requests += 1;
+                Ok(future)
+            }
+            Poll::Ready(Err(e)) => {
+                shared.close();
+                Ok(Box::pin(async { Err(e) }))
+            }
+            Poll::Pending => {
+                shared.direct = false;
+                Err(request)
+            }
+        }
+    }
+}
+/// `DMESH_POOL_DIRECT=0` sends every request through the owner task.
+fn direct_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("DMESH_POOL_DIRECT").map_or(true, |v| v != "0"))
+}
+/// Identifies the calling thread; never 0.
+fn thread_token() -> usize {
+    thread_local!(static TOKEN: u8 = const { 0 });
+    TOKEN.with(|token| token as *const u8 as usize)
 }
 fn directory() -> &'static Mutex<HashMap<Key, Weak<Pool>>> {
     static POOLS: OnceLock<Mutex<HashMap<Key, Weak<Pool>>>> = OnceLock::new();
@@ -99,6 +178,8 @@ where
             pool
         } else {
             let (tx, rx) = mpsc::channel::<Message>(128);
+            let shared = Shared::new();
+            let owned = shared.clone();
             let inner = self.0.clone();
             let Some(runtime) = dmesh_doca::backend::worker_runtime(worker) else {
                 return svc::BoxService::new(svc::mk(|_| async { Err(unavailable()) }));
@@ -145,6 +226,7 @@ where
                         address,
                         route,
                         move || inner.new_service(target.clone()),
+                        &owned,
                         rx,
                         first,
                     )
@@ -152,36 +234,51 @@ where
                     drop(lease);
                 }
             });
-            let pool = Arc::new(Pool { worker, sender: tx });
+            let pool = Arc::new(Pool {
+                worker,
+                address,
+                sender: tx,
+                shared,
+            });
             pools.insert(key, Arc::downgrade(&pool));
             pool
         };
         svc::BoxService::new(Handle {
             sender: PollSender::new(pool.sender.clone()),
-            _pool: pool,
+            pool,
         })
     }
 }
 
 struct Handle {
     sender: PollSender<Message>,
-    _pool: Arc<Pool>,
+    pool: Arc<Pool>,
 }
 impl Service<http::Request<http::BoxBody>> for Handle {
     type Response = Response;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
+    type Future = ResponseFuture;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         // A listening endpoint may have no DMA flow yet. Admission must not
         // wait on publication: the first admitted request triggers creation.
         self.sender.poll_reserve(cx).map_err(|_| unavailable())
     }
-    fn call(&mut self, request: http::Request<http::BoxBody>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<http::BoxBody>) -> Self::Future {
+        if direct_enabled() {
+            match self.pool.direct(request) {
+                Ok(future) => {
+                    // The slot reserved by poll_ready goes back to the queue.
+                    self.sender.abort_send();
+                    return future;
+                }
+                Err(queued) => request = queued,
+            }
+        }
         let (reply, rx) = oneshot::channel();
         if self
             .sender
             .send_item(Message {
-                source_worker: self._pool.worker,
+                source_worker: self.pool.worker,
                 source_thread: std::thread::current().id(),
                 request,
                 reply,
@@ -210,11 +307,15 @@ struct FlowAudit {
     requests: u64,
     cross_worker: u64,
     cross_thread: u64,
+    shared: Arc<parking_lot::Mutex<Shared>>,
 }
 impl FlowAudit {
     fn report(&self) {
+        // Direct dispatches bypass the owner, which counts only what it queued.
+        let direct = self.shared.lock().requests;
         tracing::info!(address = %self.address, route = ?self.route,
-            requests = self.requests, cross_worker = self.cross_worker,
+            requests = self.requests + direct, direct,
+            cross_worker = self.cross_worker,
             cross_thread = self.cross_thread, "dmesh flow audit");
     }
 }
@@ -228,6 +329,7 @@ async fn run(
     address: SocketAddr,
     route: dmesh_doca::backend::Route,
     make: impl Fn() -> svc::BoxHttp,
+    shared: &Arc<parking_lot::Mutex<Shared>>,
     mut rx: mpsc::Receiver<Message>,
     first: Message,
 ) -> mpsc::Receiver<Message> {
@@ -237,10 +339,20 @@ async fn run(
         requests: 0,
         cross_worker: 0,
         cross_thread: 0,
+        shared: shared.clone(),
     };
     let mut first = Some(first);
-    let mut service: Option<svc::BoxHttp> = None;
     let live = dmesh_doca::backend::route_signal(address, route);
+    {
+        let mut shared = shared.lock();
+        shared.live = live.clone();
+        shared.requests = 0;
+        // On a shared multi-thread runtime the owner has no thread of its own.
+        shared.thread = match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::CurrentThread => thread_token(),
+            _ => 0,
+        };
+    }
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut audit_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
@@ -253,7 +365,7 @@ async fn run(
             tokio::select! {
                 _=audit_tick.tick()=> { audit.report(); continue; },
                 _=tick.tick()=> {
-                    if !dmesh_doca::backend::endpoint_enabled(address) { service=None; }
+                    if !dmesh_doca::backend::endpoint_enabled(address) { shared.lock().close(); }
                     continue;
                 },
                 m=rx.recv()=> match m {Some(m)=>m,None=>break},
@@ -262,38 +374,57 @@ async fn run(
         if !dmesh_doca::backend::endpoint_enabled(address)
             || !live.load(std::sync::atomic::Ordering::Acquire)
         {
-            service = None;
+            shared.lock().close();
             let _ = msg.reply.send(Err(unavailable()));
             continue;
         }
-        let svc = service.get_or_insert_with(&make);
+        {
+            // The owner waits with its own waker from here: callers queue
+            // behind this request until the transport reports ready.
+            let mut shared = shared.lock();
+            shared.direct = false;
+            shared.service.get_or_insert_with(&make);
+        }
+        let poll_ready = std::future::poll_fn(|cx| match shared.lock().service.as_mut() {
+            Some(svc) => svc.poll_ready(cx),
+            None => Poll::Ready(Err(unavailable())),
+        });
         // Original request timeouts drop the receiver even while waiting for H2.
         let ready = tokio::select! {
             _=msg.reply.closed()=>continue,
-            ready=tokio::time::timeout(std::time::Duration::from_secs(3),svc.ready())=> {
+            ready=tokio::time::timeout(std::time::Duration::from_secs(3),poll_ready)=> {
                 match ready { Ok(r)=>r, Err(_)=> { tracing::warn!(worker = route.worker, %address, "dmesh H2 readiness timed out"); Err(unavailable()) } }
             },
         };
-        match ready {
-            Err(e) => {
-                let _ = msg.reply.send(Err(e));
-                service = None;
+        if let Err(e) = ready {
+            let _ = msg.reply.send(Err(e));
+            shared.lock().close();
+            continue;
+        }
+        let future = {
+            let mut shared = shared.lock();
+            let future = shared.service.as_mut().map(|svc| svc.call(msg.request));
+            shared.direct = future.is_some();
+            future
+        };
+        match future {
+            None => {
+                let _ = msg.reply.send(Err(unavailable()));
             }
-            Ok(svc) => {
+            Some(future) => {
                 audit.requests += 1;
                 audit.cross_worker += u64::from(msg.source_worker != route.worker);
                 audit.cross_thread += u64::from(msg.source_thread != std::thread::current().id());
                 if audit.requests % 100_000 == 0 {
                     audit.report();
                 }
-                let future = svc.call(msg.request);
                 tokio::spawn(async move {
                     tokio::select! { _=msg.reply.closed()=>{}, result=future=>{ let _=msg.reply.send(result); } }
                 });
             }
         }
     }
-    drop(service);
+    shared.lock().close();
     rx
 }
 
@@ -307,10 +438,8 @@ impl Drop for RouteLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
+    use linkerd_app_core::svc::ServiceExt;
+    use std::sync::atomic::AtomicUsize;
     #[derive(Clone)]
     struct Target(SocketAddr);
     impl Param<Remote<ServerAddr>> for Target {
@@ -458,6 +587,18 @@ mod tests {
         .unwrap();
         let _handle1 = publish.await.unwrap();
         assert_eq!(worker1_creates.load(Ordering::SeqCst), 1);
+        // Worker 1's owner shares this thread, so once its transport is up a
+        // caller dispatches directly; worker 0's owner has its own thread, and
+        // its callers here always go through the queue.
+        let direct = |worker| {
+            let pools = directory().lock().unwrap();
+            let (_, pool) = pools.iter().find(|(key, _)| key.worker == worker).unwrap();
+            let pool = pool.upgrade().unwrap();
+            let requests = pool.shared.lock().requests;
+            requests
+        };
+        assert_eq!(direct(1), 1);
+        assert_eq!(direct(0), 0);
         assert_eq!(
             creates.load(Ordering::SeqCst),
             1,
@@ -481,15 +622,17 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let pool = Arc::new(Pool {
             worker: 0,
+            address,
             sender: tx,
+            shared: Shared::new(),
         });
         let mut h1 = Handle {
             sender: PollSender::new(pool.sender.clone()),
-            _pool: pool.clone(),
+            pool: pool.clone(),
         };
         let mut h2 = Handle {
             sender: PollSender::new(pool.sender.clone()),
-            _pool: pool,
+            pool,
         };
         h1.ready().await.unwrap();
         assert!(

@@ -145,7 +145,10 @@ where
             .extensions()
             .get::<crate::flow_stats::FlowCounters>()
             .cloned()
-            .map(|counters| (counters, std::time::Instant::now()));
+            .map(|counters| {
+                ::h2::probe::record(::h2::probe::BACKEND_START);
+                (counters, std::time::Instant::now())
+            });
         let span = match self {
             Self::H2(_) => debug_span!("h2"),
             Self::Http1(_) => debug_span!("http1"),

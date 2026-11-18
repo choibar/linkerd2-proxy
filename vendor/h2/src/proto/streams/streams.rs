@@ -504,7 +504,14 @@ impl Inner {
 
             let res = if stream.state.is_recv_headers() {
                 match actions.recv.recv_headers(frame, stream, counts) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        crate::probe::record(if peer.is_server() {
+                            crate::probe::SRV_RECV_REQ
+                        } else {
+                            crate::probe::CLI_RECV_RSP
+                        });
+                        Ok(())
+                    }
                     Err(RecvHeaderBlockError::Oversize(resp)) => {
                         if let Some(resp) = resp {
                             let sent = actions.send.send_headers(
@@ -1003,6 +1010,21 @@ where
             }
         }
         Poll::Ready(Ok(()))
+    }
+
+    /// `poll_pending_open` without registering a waker: whether `pending` is
+    /// still waiting to open.
+    pub fn is_pending_open(
+        &self,
+        pending: Option<&OpaqueStreamRef>,
+    ) -> Result<bool, crate::Error> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        me.actions.ensure_no_conn_error()?;
+        me.actions.send.ensure_next_stream_id()?;
+
+        Ok(pending.is_some_and(|pending| me.store.resolve(pending.key).is_pending_open))
     }
 }
 

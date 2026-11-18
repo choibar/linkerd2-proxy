@@ -95,9 +95,18 @@ members = [
     "spiffe-proto",
 ]
 
+# Thin LTO over 16 codegen units: the binary crate rebuilds in ~6 min instead
+# of ~18, at ~5% less capacity. Use for iteration; benchmark with `perf`.
 [profile.release]
 debug = 1
-lto = true
+lto = "thin"
+codegen-units = 16
+
+# Benchmark builds (`cargo build --profile perf`, target/perf/): fat LTO over
+# one codegen unit, the settings every earlier benchmark used.
+[profile.perf]
+inherits = "release"
+lto = "fat"
 codegen-units = 1
 
 [workspace.package]

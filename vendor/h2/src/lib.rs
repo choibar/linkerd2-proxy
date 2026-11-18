@@ -134,6 +134,7 @@ pub mod frame;
 
 pub mod client;
 pub mod ext;
+pub mod probe;
 pub mod server;
 mod share;
 

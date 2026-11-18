@@ -120,6 +120,12 @@ where
     fn send_reset(self: Pin<&mut Self>, reason: h2::Reason) {
         self.project().body_tx.send_reset(reason);
     }
+
+    /// `send_reset` for a pipe that is not pinned.
+    #[cfg(feature = "client")]
+    fn reset(&mut self, reason: h2::Reason) {
+        self.body_tx.send_reset(reason);
+    }
 }
 
 impl<S> Future for PipeToSendStream<S>

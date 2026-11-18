@@ -24,6 +24,7 @@
 #include "object.h"
 #include "dpa.h"
 #include "dpa_common.h"
+#include "dpa_mux.h"
 #include "ring.h"
 #include "peer_node.h"
 
@@ -360,8 +361,10 @@ int32_t dmesh_doca_conn_staging_base(struct objects *objs, int32_t slot,
 }
 
 /* Pop the next completed recv segment for a slot into (*out_pos, *out_len).
- * Returns DOCA_SUCCESS with a segment, or DOCA_ERROR_EMPTY when none pending.
- * Single-consumer: only the driver task calls this. */
+ * Returns DOCA_SUCCESS with a segment, DOCA_ERROR_SHUTDOWN at end of stream
+ * (the host closed its sending half and every byte it sent was popped), or
+ * DOCA_ERROR_EMPTY when none pending. Single-consumer: only the driver task
+ * calls this. */
 int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
 				 uint32_t *out_pos, uint32_t *out_len)
 {
@@ -373,8 +376,14 @@ int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot,
 		return DOCA_ERROR_INVALID_VALUE;
 
 	conn = &objs->conns[slot];
-	if (conn->recv_seg_cnt == 0)
-		return DOCA_ERROR_EMPTY;
+	if (conn->recv_seg_cnt == 0) {
+		/* Forward copies taken so far, one per descriptor: the flow's own
+		 * thread counts them on its msgq, a mux flow on its ring. */
+		uint64_t done = conn->mux ? conn->mux_received :
+				conn->dpa_comch != NULL ? conn->dpa_comch->dma_completed : 0;
+		return conn->host_shut && (conn->mux || conn->dpa_comch != NULL) &&
+		       done >= conn->host_shut_descs ? DOCA_ERROR_SHUTDOWN : DOCA_ERROR_EMPTY;
+	}
 
 	seg = &conn->recv_segs[conn->recv_seg_head];
 	*out_pos = seg->pos;
@@ -398,11 +407,13 @@ int32_t dmesh_doca_conn_recv_release(struct objects *objs, int32_t slot,
 	return DOCA_SUCCESS;
 }
 
-/* Update the DPU RX consumed position in this slot's DPA thread
- * (dpa_thread_ctx.rx_consumed_pos in TLS) so the kernel's staging gate can advance. Called
- * from the driver tick only after full segment consumption. Releases smaller
- * than DMESH_RX_CONSUMED_POS_BATCH are withheld to amortize the synchronous
- * h2d_memcpy; the gate still has room for a descriptor and a wrap's skipped tail. */
+/* Update the DPU RX consumed position the slot's DPA thread gates its staging
+ * on. Called from the driver tick only after full segment consumption. A mux
+ * flow's position is a store into ARM memory the DPA reads, made on every
+ * change. A pool thread's lives in its TLS (dpa_thread_ctx.rx_consumed_pos);
+ * releases smaller than DMESH_RX_CONSUMED_POS_BATCH are withheld to amortize
+ * the synchronous h2d_memcpy, and the gate still has room for a descriptor and
+ * a wrap's skipped tail. */
 #define DMESH_RX_CONSUMED_POS_BATCH (64u * 1024u)
 _Static_assert(DMESH_RX_CONSUMED_POS_BATCH + 2u * 8064u < BUFFER_SIZE,
                "consumed-position batching must leave room at the staging gate");
@@ -417,54 +428,34 @@ int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t
 		return DOCA_ERROR_INVALID_VALUE;
 	conn = &objs->conns[slot];
 	t = conn->dpa_thread;
-	if (t == NULL || t->thread == NULL || t->local_storage == 0)
+	if (!conn->mux && (t == NULL || t->thread == NULL || t->local_storage == 0))
 		return DOCA_ERROR_BAD_STATE;
 	pos %= BUFFER_SIZE;
-	if ((pos + BUFFER_SIZE - conn->rx_consumed_pos_published) % BUFFER_SIZE < DMESH_RX_CONSUMED_POS_BATCH)
+	if (pos == conn->rx_consumed_pos_published ||
+	    (!conn->mux && (pos + BUFFER_SIZE - conn->rx_consumed_pos_published) % BUFFER_SIZE < DMESH_RX_CONSUMED_POS_BATCH))
 		return DOCA_SUCCESS;
-	result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
-				   &pos, sizeof(pos)));
+	if (conn->mux)
+		result = dmesh_dpa_mux_rx_consumed(conn, pos);
+	else
+		result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(t->dpa, t->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
+					   &pos, sizeof(pos)));
 	if (result == DOCA_SUCCESS)
 		conn->rx_consumed_pos_published = pos;
 	return result;
 }
 
-/* doca_dpa_dev_comch_producer_dma_copy (the fused copy+notify the host reverse
- * DPA runs) fires a completion only when the copy is a multiple of 128B, or a
- * single sub-block <=128B. Emit the largest 128-aligned copy (<=8064 = 63*128,
- * under the 8KB single-DMA limit); the final <=128B tail is a valid sub-block.
- * The host reassembles the response byte stream from the segments. */
-#define DMESH_TX_DMA_MAXMUL 8064
-
-/* Reverse (response) path: queue outbound bytes for DMA back to the host's
- * rcvbuf. Copies data into this connection's tx_staging and appends
- * descriptor(s) to its rcv_ring; the host's DPA thread polls the ring and
- * performs the DPU->host DMA. Returns the number of bytes accepted (may be < len
- * when the ring is momentarily full - the driver retries the remainder), or a
- * negative doca_error_t. Single-producer: only the driver task calls this.
- *
- * TODO(flow-control): tx_staging has no host-consumption backpressure yet, so a
- * response larger than tx_staging_len could wrap and overwrite bytes the host
- * has not DMA'd. Fine for the current sub-buffer responses; a staging watermark
- * (mirror of the recv path) is the general fix. */
-/* Flow mode of a slot: 0 = client flow, 1 = backend provider (see
- * DMESH_FLOW_MODE_*). Negative doca_error_t on bad args. */
+/* Flow mode of a slot: DMESH_FLOW_MODE_BACKEND (1) for a backend provider,
+ * DMESH_FLOW_MODE_CLIENT for a client flow. Negative doca_error_t on bad args. */
 int32_t dmesh_doca_conn_mode_get(struct objects *objs, int32_t slot)
 {
 	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
 		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
-	/* BACKEND_PULL is a backend flow whose reverse path the host's DPA pulls
-	 * (the host library's host-dpa reverse path); the role is what callers switch on, the
-	 * wire is the datapath's business (DMESH_FLOW_USES_PUSH on flow.mode). */
-	if (objs->conns[slot].flow.mode == DMESH_FLOW_MODE_BACKEND_PULL)
-		return (int32_t)DMESH_FLOW_MODE_BACKEND;
 	return (int32_t)objs->conns[slot].flow.mode;
 }
 
 /* Report the connection's mapped tx_staging region so the Rust writer can copy
  * response bytes straight into it (write-side zero-copy). Usable length
- * reserves a 64B tail for the backend push descriptor shadow (harmless to
- * reserve on client channels too, keeping one rule). Negative on bad state. */
+ * reserves a 64B tail for the host cursor's shadow. Negative on bad state. */
 int32_t dmesh_doca_conn_tx_staging(struct objects *objs, int32_t slot,
 				   uintptr_t *out_base, size_t *out_len)
 {
@@ -475,7 +466,7 @@ int32_t dmesh_doca_conn_tx_staging(struct objects *objs, int32_t slot,
 		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
 	conn = &objs->conns[slot];
 	if (conn->state != DMESH_CONN_RUNNING || conn->dma_closing ||
-	    !conn->reverse_exported || conn->tx_staging == NULL || conn->tx_staging_len <= 64)
+	    !conn->reverse_ready || conn->tx_staging == NULL || conn->tx_staging_len <= 64)
 		return -(int32_t)DOCA_ERROR_BAD_STATE;   /* reverse path not ready yet */
 
 	*out_base = (uintptr_t)conn->tx_staging;
@@ -492,10 +483,11 @@ int32_t dmesh_doca_conn_tx_completed(struct objects *objs, int32_t slot, uint64_
 }
 
 /* Publish response bytes the Rust side already wrote into tx_staging at
- * [pos, pos+len) - NO memcpy. Returns bytes accepted (may be < len if the DMA
- * ring/backend batch is momentarily full; the driver retries), or a negative
- * doca_error_t. The range never crosses the staging wrap (the writer splits at
- * the boundary and calls again). */
+ * [pos, pos+len) - NO memcpy: the worker's reverse DPA thread copies them to
+ * the host. Returns bytes accepted (may be < len while the host's window or the
+ * thread's ring is full; the driver retries), or a negative doca_error_t. The
+ * range never crosses the staging wrap (the writer splits at the boundary and
+ * calls again). */
 int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot,
 				    uint32_t pos, uint32_t len)
 {
@@ -507,64 +499,23 @@ int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot,
 
 	conn = &objs->conns[slot];
 
-	/* Backend channels (안 2): push with this connection's doca_dma engine -
-	 * no rcv_ring, no host DPA. One <=8KB batch outstanding; the driver
-	 * retries the remainder on later ticks. */
-	if (DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
-		if (!conn->reverse_exported || conn->tx_staging == NULL)
-			return -(int32_t)DOCA_ERROR_BAD_STATE;
-		while (sent < len) {
-			int r = dmesh_dma_push_staged(conn, pos + (uint32_t)sent,
-						      len - (uint32_t)sent);
-
-			if (r < 0)
-				return sent > 0 ? (int32_t)sent : (int32_t)r;
-			if (r == 0)
-				break;          /* batch in flight; retry later */
-			sent += (size_t)r;
-		}
-		return (int32_t)sent;
-	}
-
-	if (!conn->reverse_exported || conn->tx_staging == NULL || conn->rcv_ring == NULL)
+	if (!conn->reverse_ready || conn->tx_staging == NULL)
 		return -(int32_t)DOCA_ERROR_BAD_STATE;   /* reverse path not ready yet */
-
 	while (sent < len) {
-		size_t remaining = len - sent;
-		size_t chunk;
-		struct dma_desc *desc;
+		int r = dmesh_dma_push_staged(conn, pos + (uint32_t)sent, len - (uint32_t)sent);
 
-		/* 128-align the descriptor (see DMESH_TX_DMA_MAXMUL): largest
-		 * multiple of 128 up to 8064, or a single <=128B sub-block for the
-		 * tail. The bytes are already in staging; we only emit descriptors. */
-		if (remaining <= 128)
-			chunk = remaining;
-		else if (remaining >= DMESH_TX_DMA_MAXMUL)
-			chunk = DMESH_TX_DMA_MAXMUL;
-		else
-			chunk = remaining & ~(size_t)127;
-
-		/* Non-blocking ring check: report a partial send rather than
-		 * busy-waiting in the driver thread if the host is behind. */
-		if (conn->rcv_ring->head - conn->rcv_ring->ctrl->consumer_head >= conn->rcv_ring->size)
-			break;
-
-		desc = get_next_dma_desc(conn->rcv_ring);
-		desc->mmap = 0;   /* kernel uses thread_arg->host_mmap as the source */
-		desc->addr = (uint64_t)conn->tx_staging + pos + sent;
-		desc->size = chunk;
-		commit_dma_desc(conn->rcv_ring);
-
-		sent += chunk;
+		if (r < 0)
+			return sent > 0 ? (int32_t)sent : (int32_t)r;
+		if (r == 0)
+			break;          /* window or ring full; retry later */
+		sent += (size_t)r;
 	}
-
 	return (int32_t)sent;
 }
 
-/* The stack shut down its write half and every staged byte completed DMA. On a
- * push flow the host reads end of stream after the last batch; the flow stays
- * open for the host's bytes until the host closes it. Other flows return
- * DOCA_ERROR_NOT_SUPPORTED and are unchanged. */
+/* The stack shut down its write half and every staged byte completed DMA. The
+ * host reads end of stream after the last batch; the flow stays open for the
+ * host's bytes until the host closes it. */
 int32_t dmesh_doca_conn_shutdown(struct objects *objs, int32_t slot)
 {
 	struct dmesh_conn *conn;
@@ -572,7 +523,7 @@ int32_t dmesh_doca_conn_shutdown(struct objects *objs, int32_t slot)
 	if (objs == NULL || slot < 0 || slot >= DMESH_MAX_CONNECTIONS)
 		return -(int32_t)DOCA_ERROR_INVALID_VALUE;
 	conn = &objs->conns[slot];
-	if (conn->state != DMESH_CONN_RUNNING || !DMESH_FLOW_USES_PUSH(conn->flow.mode))
+	if (conn->state != DMESH_CONN_RUNNING)
 		return -(int32_t)DOCA_ERROR_NOT_SUPPORTED;
 	conn->push_fin_requested = true;
 	return dmesh_dma_push_fin(conn);

@@ -119,6 +119,48 @@ impl From<&FlowId> for DmeshTarget {
 /// authz gate can enforce it without threading a concrete `GetPolicy` type.
 pub type DmeshGetPolicy = Arc<dyn Fn(OrigDstAddr) -> AllowPolicy + Send + Sync>;
 
+/// Builds the inbound role of one connection's HTTP service (access log,
+/// request authorization, local rate limit) from its target and the
+/// destination's inbound policy; see `linkerd_app_inbound::fused`.
+pub type DmeshHttpWrap = Arc<dyn Fn(&DmeshTarget, AllowPolicy) -> http::conn_wrap::Wrap + Send + Sync>;
+
+/// The destinations whose inbound policy belongs to another workload than the
+/// proxy's own: `DMESH_INBOUND_WORKLOADS` names a file with one
+/// `<destination IPv4> <policy workload>` pair per line, the workload as the
+/// policy controller takes it (`{"ns":"<namespace>","pod":"<pod>"}`). A sidecar
+/// asks for the policy of the one pod it runs in; this proxy is the inbound
+/// enforcement point of every destination it serves, so it asks per destination.
+pub fn inbound_workloads_from_env() -> std::collections::HashMap<std::net::IpAddr, Arc<str>> {
+    let mut map = std::collections::HashMap::new();
+    let Some(path) = std::env::var_os("DMESH_INBOUND_WORKLOADS") else {
+        return map;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            warn!(?path, %error, "DMESH_INBOUND_WORKLOADS is unreadable; every destination uses the proxy's own workload");
+            return map;
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once(char::is_whitespace) {
+            Some((ip, workload)) => match ip.parse::<std::net::IpAddr>() {
+                Ok(ip) => {
+                    map.insert(ip, Arc::from(workload.trim()));
+                }
+                Err(error) => warn!(%line, %error, "DMESH_INBOUND_WORKLOADS: bad address"),
+            },
+            None => warn!(%line, "DMESH_INBOUND_WORKLOADS: expected '<ip> <workload>'"),
+        }
+    }
+    info!(destinations = map.len(), "dmesh inbound policy workloads loaded");
+    map
+}
+
 /// Serve DMA connections through the FUSED inbound-authz + outbound stack until
 /// the event stream ends or shutdown is signalled. Each connection is gated by
 /// the destination's inbound `AuthorizationPolicy` (the inbound role) using the
@@ -130,6 +172,7 @@ pub async fn serve<N>(
     registrar: Registrar,
     outbound: N,
     get_policy: DmeshGetPolicy,
+    http_wrap: DmeshHttpWrap,
     shutdown: impl Future,
 ) where
     N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + Sync + 'static,
@@ -152,7 +195,7 @@ pub async fn serve<N>(
         let ev = tokio::select! {
             _ = &mut shutdown => return,
             Some(peer) = peers.recv() => {
-                serve_flow(peer.flow, peer.io, &outbound, &get_policy).await;
+                serve_flow(peer.flow, peer.io, &outbound, &get_policy, &http_wrap).await;
                 continue;
             },
             ev = events.recv() => match ev {
@@ -255,6 +298,9 @@ pub async fn serve<N>(
                 }
 
                 let span = debug_span!("dmesh", slot, src = %flow.src, orig_dst = %flow.dst);
+                // The rest of the inbound role runs per request, around this
+                // connection's HTTP service.
+                let wrap = http_wrap(&target, policy);
                 let svc = dmesh_doca::origin::sync_scope(flow.origin.clone(), || {
                     outbound.new_service(target)
                 });
@@ -262,12 +308,15 @@ pub async fn serve<N>(
                 migrations.insert(slot, signal);
                 let serve = http::conn_drain::scope(
                     drain,
-                    dmesh_doca::origin::scope(flow.origin, async move {
-                        match svc.oneshot(io).await {
-                            Ok(()) => debug!("dmesh connection closed"),
-                            Err(error) => debug!(%error, "dmesh connection failed"),
-                        }
-                    }),
+                    dmesh_doca::origin::scope(
+                        flow.origin,
+                        http::conn_wrap::scope(wrap, async move {
+                            match svc.oneshot(io).await {
+                                Ok(()) => debug!("dmesh connection closed"),
+                                Err(error) => debug!(%error, "dmesh connection failed"),
+                            }
+                        }),
+                    ),
                 );
                 if http::flow_stats::enabled() {
                     // Count this connection's requests, CPU and backend wait
@@ -308,9 +357,15 @@ pub async fn serve<N>(
     }
 }
 
-
-async fn serve_flow<N>(flow: FlowId, io: DmeshIo, outbound: &N, get_policy: &DmeshGetPolicy)
-where N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + Sync + 'static {
+async fn serve_flow<N>(
+    flow: FlowId,
+    io: DmeshIo,
+    outbound: &N,
+    get_policy: &DmeshGetPolicy,
+    http_wrap: &DmeshHttpWrap,
+) where
+    N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + Sync + 'static,
+{
     let target = DmeshTarget::from(&flow);
     if flow.origin.is_some() && target.client_id().is_none() {
         warn!("verified Pod identity could not be mapped to the configured mesh trust domain");
@@ -326,11 +381,18 @@ where N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + Sync +
         return;
     }
     let span = debug_span!("dmesh", src = %flow.src, orig_dst = %flow.dst);
+    let wrap = http_wrap(&target, policy);
     let svc = dmesh_doca::origin::sync_scope(flow.origin.clone(), || outbound.new_service(target));
-    tokio::spawn(dmesh_doca::origin::scope(flow.origin, async move {
-        match svc.oneshot(io).await {
-            Ok(()) => debug!("dmesh connection closed"),
-            Err(error) => debug!(%error, "dmesh connection failed"),
-        }
-    }).instrument(span));
+    tokio::spawn(
+        dmesh_doca::origin::scope(
+            flow.origin,
+            http::conn_wrap::scope(wrap, async move {
+                match svc.oneshot(io).await {
+                    Ok(()) => debug!("dmesh connection closed"),
+                    Err(error) => debug!(%error, "dmesh connection failed"),
+                }
+            }),
+        )
+        .instrument(span),
+    );
 }
