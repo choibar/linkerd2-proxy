@@ -10,7 +10,10 @@
 //! is recorded.
 //!
 //! Once a second the shard prints, per site, the polls, poll time and counts
-//! since its last line, and the thread's totals over the same interval, so
+//! since its last line, the tasks spawned there, and the same figures for the
+//! site's long-lived tasks alone (those alive for a whole report interval: a
+//! connection task as against the per-request tasks one executor call site
+//! spawns), and the thread's totals over the same interval, so
 //! its CPU can be split by task kind: what no site covers (the runtime's I/O
 //! and timer driver, the `block_on` future) is the total minus their sum.
 //! Needs `--cfg tokio_unstable`; off, the runtime has no hooks.
@@ -33,13 +36,24 @@ struct Stat {
     polls: u64,
     ns: u64,
     counts: Counts,
+    spawns: u64,
+}
+
+/// A site's totals and the share of its long-lived tasks.
+#[derive(Default)]
+struct SiteStat {
+    all: Stat,
+    long: Stat,
 }
 
 thread_local! {
     static PMU: Option<Vec<dmesh_doca::pmu::Counter>> = open_pmu();
     static POLL_START: Cell<Option<(Instant, Counts)>> = const { Cell::new(None) };
     // site address -> (site, stats)
-    static SITES: RefCell<HashMap<usize, (Site, Stat)>> = RefCell::new(HashMap::new());
+    static SITES: RefCell<HashMap<usize, (Site, SiteStat)>> = RefCell::new(HashMap::new());
+    // Highest task id polled so far, and that value one and two reports ago:
+    // a task at or below the oldest has lived through a whole interval.
+    static IDS: Cell<[Option<tokio::task::Id>; 3]> = const { Cell::new([None; 3]) };
 }
 
 fn open_pmu() -> Option<Vec<dmesh_doca::pmu::Counter>> {
@@ -74,6 +88,16 @@ pub fn enabled() -> bool {
 pub fn install(builder: &mut tokio::runtime::Builder) {
     #[cfg(tokio_unstable)]
     builder
+        .on_task_spawn(|meta| {
+            let site = meta.spawned_at();
+            SITES.with(|sites| {
+                let mut sites = sites.borrow_mut();
+                let (_, s) = sites
+                    .entry(site as *const _ as usize)
+                    .or_insert((site, SiteStat::default()));
+                s.all.spawns += 1;
+            });
+        })
         .on_before_task_poll(|_| {
             let counts = read_counts();
             POLL_START.with(|s| s.set(Some((Instant::now(), counts))))
@@ -85,15 +109,28 @@ pub fn install(builder: &mut tokio::runtime::Builder) {
             let ns = start.elapsed().as_nanos() as u64;
             let after = read_counts();
             let site = meta.spawned_at();
+            let id = meta.id();
+            let mut ids = IDS.with(Cell::get);
+            if ids[0] < Some(id) {
+                ids[0] = Some(id);
+                IDS.with(|c| c.set(ids));
+            }
+            let long = ids[2].is_some_and(|mark| id <= mark);
             SITES.with(|sites| {
                 let mut sites = sites.borrow_mut();
                 let (_, s) = sites
                     .entry(site as *const _ as usize)
-                    .or_insert((site, Stat::default()));
-                s.polls += 1;
-                s.ns += ns;
-                for i in 0..3 {
-                    s.counts[i] += after[i].wrapping_sub(before[i]);
+                    .or_insert((site, SiteStat::default()));
+                let add = |s: &mut Stat| {
+                    s.polls += 1;
+                    s.ns += ns;
+                    for i in 0..3 {
+                        s.counts[i] += after[i].wrapping_sub(before[i]);
+                    }
+                };
+                add(&mut s.all);
+                if long {
+                    add(&mut s.long);
                 }
             });
         });
@@ -103,7 +140,9 @@ pub fn install(builder: &mut tokio::runtime::Builder) {
 
 /// Prints this shard's per-site stats every second, as `taskstat unix_ns=..
 /// worker=.. site=file:line polls=.. poll_ns=.. instructions=.. cycles=..
-/// l1i_refills=..`, then the thread's totals over the interval as a
+/// l1i_refills=.. spawns=..`, a `taskstat-long` line with the same fields for
+/// the site's long-lived tasks when it also polled short-lived ones, then the
+/// thread's totals over the interval as a
 /// `site=thread` line (`polls` 0, `poll_ns` the interval), then each client
 /// connection's cumulative requests, poll time and instructions as
 /// `taskflow unix_ns=.. worker=.. slot=.. requests=.. cpu_ns=.. instructions=..`.
@@ -115,27 +154,36 @@ pub async fn report(worker: usize) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let line = |site: &str, s: &Stat| {
+        let line = |kind: &str, site: &str, s: &Stat| {
             eprintln!(
-                "taskstat unix_ns={now} worker={worker} site={site} polls={} poll_ns={} \
-                 instructions={} cycles={} l1i_refills={}",
-                s.polls, s.ns, s.counts[0], s.counts[1], s.counts[2]
+                "{kind} unix_ns={now} worker={worker} site={site} polls={} poll_ns={} \
+                 instructions={} cycles={} l1i_refills={} spawns={}",
+                s.polls, s.ns, s.counts[0], s.counts[1], s.counts[2], s.spawns
             )
         };
         let sites: Vec<_> = SITES.with(|s| s.borrow_mut().drain().map(|(_, v)| v).collect());
         for (site, s) in &sites {
-            line(&format!("{}:{}", site.file(), site.line()), s);
+            let site = format!("{}:{}", site.file(), site.line());
+            line("taskstat", &site, &s.all);
+            if s.long.polls > 0 && s.long.polls < s.all.polls {
+                line("taskstat-long", &site, &s.long);
+            }
         }
+        IDS.with(|c| {
+            let ids = c.get();
+            c.set([ids[0], ids[0], ids[1]]);
+        });
         let counts = read_counts();
         let mut total = Stat {
             polls: 0,
             ns: last.0.elapsed().as_nanos() as u64,
             counts: [0; 3],
+            spawns: 0,
         };
         for i in 0..3 {
             total.counts[i] = counts[i].wrapping_sub(last.1[i]);
         }
-        line("thread", &total);
+        line("taskstat", "thread", &total);
         last = (Instant::now(), counts);
         // Each counted client connection's cumulative flow statistics.
         for (slot, c) in dmesh_doca::flowstats::snapshot_all(worker) {
