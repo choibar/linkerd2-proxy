@@ -483,3 +483,112 @@ impl<T> Permitted<T> {
         self.permit_ref().labels.route.clone().into()
     }
 }
+
+// === impl FusedHttpPolicy ===
+
+/// Enforces a destination's inbound policy on each request of a connection
+/// that reaches the proxy with its source already attested (the DMA path),
+/// where no inbound server stack runs: the route the request matches must
+/// authorize the source, the route's filters apply, and the server's local
+/// rate limit is charged. A refused request gets its response here. A server
+/// without HTTP routes (opaque, TLS) passes every request.
+///
+/// Unlike [`NewHttpPolicy`], the inner service is the connection's and is
+/// called in place.
+#[derive(Clone, Debug)]
+pub struct FusedHttpPolicy<S> {
+    check: HttpPolicyService<(), ()>,
+    inner: S,
+}
+
+impl<S> FusedHttpPolicy<S> {
+    pub fn new(
+        inner: S,
+        policy: AllowPolicy,
+        client: Remote<ClientAddr>,
+        tls: tls::ConditionalServerTls,
+        metrics: HttpAuthzMetrics,
+    ) -> Self {
+        let dst = policy.dst_addr();
+        Self {
+            check: HttpPolicyService {
+                target: (),
+                connection: ConnectionMeta { dst, client, tls },
+                policy,
+                metrics,
+                inner: (),
+            },
+            inner,
+        }
+    }
+
+    fn permit<B>(&self, req: &mut ::http::Request<B>) -> Result<()> {
+        match self.check.policy.routes() {
+            // An opaque or TLS server has no HTTP routes: its authorization is
+            // the connection's, decided when the connection was accepted.
+            None => return Ok(()),
+            Some(Routes::Http(routes)) => {
+                let (_, mtch, route) = self.check.authorize(&routes, req)?;
+                apply_http_filters(mtch, route, req)?;
+            }
+            Some(Routes::Grpc(routes)) => {
+                let (_, _, route) = self.check.authorize(&routes, req)?;
+                apply_grpc_filters(route, req)?;
+            }
+        }
+        self.check.check_rate_limit()
+    }
+}
+
+impl<B, RspB, S> svc::Service<::http::Request<B>> for FusedHttpPolicy<S>
+where
+    S: svc::Service<::http::Request<B>, Response = ::http::Response<RspB>, Error = Error>,
+    RspB: Default,
+{
+    type Response = S::Response;
+    type Error = Error;
+    type Future = future::Either<S::Future, future::Ready<Result<Self::Response>>>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> task::Poll<Result<()>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: ::http::Request<B>) -> Self::Future {
+        match self.permit(&mut req) {
+            Ok(()) => future::Either::Left(self.inner.call(req)),
+            Err(error) => future::Either::Right(future::ok(refusal(&req, &error))),
+        }
+    }
+}
+
+/// The response to a request the policy refused: the status a sidecar's
+/// inbound server answers with (403, 404, 429; 500 otherwise), as a gRPC
+/// status on a gRPC request.
+fn refusal<B, RspB: Default>(req: &::http::Request<B>, error: &Error) -> ::http::Response<RspB> {
+    let (status, grpc, message) = if error.is::<HttpRouteUnauthorized>() {
+        (::http::StatusCode::FORBIDDEN, "7", "unauthorized request on route")
+    } else if error.is::<HttpRouteNotFound>() {
+        (::http::StatusCode::NOT_FOUND, "5", "no route found for request")
+    } else if error.is::<super::RateLimitError>() {
+        (::http::StatusCode::TOO_MANY_REQUESTS, "8", "rate limit exceeded")
+    } else {
+        (::http::StatusCode::INTERNAL_SERVER_ERROR, "13", "invalid server policy")
+    };
+    tracing::info!(%error, %status, "Request refused by the destination's inbound policy");
+    let is_grpc = req
+        .headers()
+        .get(::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/grpc"));
+    let rsp = ::http::Response::builder().version(req.version());
+    let rsp = if is_grpc {
+        rsp.status(::http::StatusCode::OK)
+            .header(::http::header::CONTENT_TYPE, "application/grpc")
+            .header("grpc-status", grpc)
+            .header("grpc-message", message)
+    } else {
+        rsp.status(status).header(::http::header::CONTENT_LENGTH, "0")
+    };
+    rsp.body(RspB::default()).expect("response must be valid")
+}

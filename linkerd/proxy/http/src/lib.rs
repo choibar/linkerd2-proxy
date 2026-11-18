@@ -8,6 +8,7 @@ pub mod balance;
 pub mod client;
 pub mod client_handle;
 pub mod conn_drain;
+pub mod conn_wrap;
 pub mod flow_stats;
 pub mod h1;
 pub mod h2;
