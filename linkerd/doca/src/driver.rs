@@ -715,19 +715,22 @@ impl Driver {
         let mut stats_last = Instant::now();
         let mut stats_prev = self.stats();
 
-        // DMESH_BUSY_POLL=1 polls both progress engines in a tight loop instead
-        // of sleeping on their notification fds. Profiling the datapath showed
-        // epoll_pwait taking >50% of the core at saturation: with a request/
-        // response workload each wakeup carries only a message or two, so the
-        // per-wakeup cost (epoll round-trip + PE re-arm) is paid per message
-        // rather than amortized over a batch. Busy-polling trades an always-hot
-        // core for removing that cost. (Mirrors DPUMESH_BUSY_POLL in the C
-        // worker, dpu_worker.c.)
+        // Busy-poll is the default: both progress engines are polled in a tight
+        // loop instead of sleeping on their notification fds. Profiling the
+        // datapath showed epoll_pwait taking >50% of the core at saturation:
+        // with a request/response workload each wakeup carries only a message
+        // or two, so the per-wakeup cost (epoll round-trip + PE re-arm) is paid
+        // per message rather than amortized over a batch. Busy-polling trades
+        // an always-hot core for removing that cost. DMESH_BUSY_POLL=0 selects
+        // the event-driven loop, which sleeps when idle. (The C worker,
+        // dpu_worker.c, reads the same variable but defaults to event-driven.)
         let busy_poll = std::env::var("DMESH_BUSY_POLL")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
         if busy_poll {
             tracing::info!("dmesh driver: busy-poll mode (progress engines polled, fds unused)");
+        } else {
+            tracing::info!("dmesh driver: event-driven mode (DMESH_BUSY_POLL=0)");
         }
 
         loop {

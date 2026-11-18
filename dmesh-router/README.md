@@ -46,7 +46,7 @@ C-side changes.
 | `DMESH_ROUTER_BACKEND_WAIT_MS` | `5000` | How long a request waits for its backend channel |
 | `DMESH_ROUTER_MAX_STREAMS` | `1000` | h2 `MAX_CONCURRENT_STREAMS` (must cover h2load `-m`) |
 | `DMESH_ROUTER_LOG` | `info` | `EnvFilter` directive |
-| `DMESH_BUSY_POLL` | *(unset)* | Read by the driver: poll the progress engines instead of sleeping |
+| `DMESH_BUSY_POLL` | *(unset = busy-poll)* | Read by the driver: busy-polls the progress engines by default; `0` sleeps on their notification fds instead (event-driven) |
 
 Routing order for a request: `DMESH_ROUTER_ROUTES[authority]` → the connection's
 flow destination (`DMESH_DST_IP`/`DMESH_DST_PORT` on the host bridge, the
