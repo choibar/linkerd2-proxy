@@ -78,6 +78,7 @@ pub(crate) struct FlowCounters(Arc<Counters>);
 impl FlowCounters {
     /// Adds the backend wait that began at `start`.
     pub(crate) fn backend(&self, start: Instant) {
+        h2::probe::record(h2::probe::BACKEND_END);
         add(&self.0, BACKEND_NS, since(start));
     }
 }
@@ -170,6 +171,7 @@ where
             return futures::future::Either::Left(self.inner.call(req));
         };
         let start = Instant::now();
+        h2::probe::record(h2::probe::RESIDENCE_START);
         req.extensions_mut().insert(FlowCounters(counters.clone()));
         let rsp = self.inner.call(req);
         futures::future::Either::Right(Box::pin(async move {
@@ -190,6 +192,7 @@ where
 }
 
 fn finish(counters: &Counters, start: Instant) {
+    h2::probe::record(h2::probe::RESIDENCE_END);
     add(counters, REQUESTS, 1);
     add(counters, RESIDENCE_NS, since(start));
 }

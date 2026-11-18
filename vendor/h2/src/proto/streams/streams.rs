@@ -504,7 +504,14 @@ impl Inner {
 
             let res = if stream.state.is_recv_headers() {
                 match actions.recv.recv_headers(frame, stream, counts) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        crate::probe::record(if peer.is_server() {
+                            crate::probe::SRV_RECV_REQ
+                        } else {
+                            crate::probe::CLI_RECV_RSP
+                        });
+                        Ok(())
+                    }
                     Err(RecvHeaderBlockError::Oversize(resp)) => {
                         if let Some(resp) = resp {
                             let sent = actions.send.send_headers(

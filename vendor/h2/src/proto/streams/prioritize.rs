@@ -542,6 +542,16 @@ impl Prioritize {
                     if let Frame::Data(ref frame) = frame {
                         self.in_flight_data_frame = InFlightData::DataFrame(frame.payload().stream);
                     }
+                    match (&frame, counts.peer().is_server()) {
+                        (Frame::Headers(_), false) => crate::probe::record(crate::probe::CLI_SEND_REQ),
+                        (Frame::Headers(h), true) if h.is_end_stream() => {
+                            crate::probe::record(crate::probe::SRV_SEND_END)
+                        }
+                        (Frame::Data(d), true) if d.is_end_stream() => {
+                            crate::probe::record(crate::probe::SRV_SEND_END)
+                        }
+                        _ => {}
+                    }
                     dst.buffer(frame).expect("invalid frame");
 
                     // Ensure the codec is ready to try the loop again.
