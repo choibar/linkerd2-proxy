@@ -114,6 +114,48 @@ impl From<&FlowId> for DmeshTarget {
 /// authz gate can enforce it without threading a concrete `GetPolicy` type.
 pub type DmeshGetPolicy = Arc<dyn Fn(OrigDstAddr) -> AllowPolicy + Send + Sync>;
 
+/// Builds the inbound role of one connection's HTTP service (access log,
+/// request authorization, local rate limit) from its target and the
+/// destination's inbound policy; see `linkerd_app_inbound::fused`.
+pub type DmeshHttpWrap = Arc<dyn Fn(&DmeshTarget, AllowPolicy) -> http::conn_wrap::Wrap + Send + Sync>;
+
+/// The destinations whose inbound policy belongs to another workload than the
+/// proxy's own: `DMESH_INBOUND_WORKLOADS` names a file with one
+/// `<destination IPv4> <policy workload>` pair per line, the workload as the
+/// policy controller takes it (`{"ns":"<namespace>","pod":"<pod>"}`). A sidecar
+/// asks for the policy of the one pod it runs in; this proxy is the inbound
+/// enforcement point of every destination it serves, so it asks per destination.
+pub fn inbound_workloads_from_env() -> std::collections::HashMap<std::net::IpAddr, Arc<str>> {
+    let mut map = std::collections::HashMap::new();
+    let Some(path) = std::env::var_os("DMESH_INBOUND_WORKLOADS") else {
+        return map;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            warn!(?path, %error, "DMESH_INBOUND_WORKLOADS is unreadable; every destination uses the proxy's own workload");
+            return map;
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once(char::is_whitespace) {
+            Some((ip, workload)) => match ip.parse::<std::net::IpAddr>() {
+                Ok(ip) => {
+                    map.insert(ip, Arc::from(workload.trim()));
+                }
+                Err(error) => warn!(%line, %error, "DMESH_INBOUND_WORKLOADS: bad address"),
+            },
+            None => warn!(%line, "DMESH_INBOUND_WORKLOADS: expected '<ip> <workload>'"),
+        }
+    }
+    info!(destinations = map.len(), "dmesh inbound policy workloads loaded");
+    map
+}
+
 /// Serve DMA connections through the FUSED inbound-authz + outbound stack until
 /// the event stream ends or shutdown is signalled. Each connection is gated by
 /// the destination's inbound `AuthorizationPolicy` (the inbound role) using the
@@ -125,6 +167,7 @@ pub async fn serve<N>(
     registrar: Registrar,
     outbound: N,
     get_policy: DmeshGetPolicy,
+    http_wrap: DmeshHttpWrap,
     shutdown: impl Future,
 ) where
     N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + 'static,
@@ -241,15 +284,21 @@ pub async fn serve<N>(
                 }
 
                 let span = debug_span!("dmesh", slot, src = %flow.src, orig_dst = %flow.dst);
+                // The rest of the inbound role runs per request, around this
+                // connection's HTTP service.
+                let wrap = http_wrap(&target, policy);
                 let svc = outbound.new_service(target);
                 let (signal, drain) = watch::channel(false);
                 migrations.insert(slot, signal);
-                let serve = http::conn_drain::scope(drain, async move {
-                    match svc.oneshot(io).await {
-                        Ok(()) => debug!("dmesh connection closed"),
-                        Err(error) => debug!(%error, "dmesh connection failed"),
-                    }
-                });
+                let serve = http::conn_drain::scope(
+                    drain,
+                    http::conn_wrap::scope(wrap, async move {
+                        match svc.oneshot(io).await {
+                            Ok(()) => debug!("dmesh connection closed"),
+                            Err(error) => debug!(%error, "dmesh connection failed"),
+                        }
+                    }),
+                );
                 if http::flow_stats::enabled() {
                     // Count this connection's requests, CPU and backend wait
                     // for the dispatcher's flow placement.
