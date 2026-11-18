@@ -206,6 +206,7 @@ where
         h2_tx,
         req_rx,
         fut_ctx: None,
+        pipe_rx: None,
         marker: PhantomData,
     })
 }
@@ -439,6 +440,10 @@ where
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
     fut_ctx: Option<FutCtx<B>>,
+    // Request bodies still being sent when their direct send got its
+    // response; `None` until direct send is enabled and once all senders are
+    // gone.
+    pipe_rx: Option<mpsc::UnboundedReceiver<PipeToSendStream<B>>>,
     marker: PhantomData<T>,
 }
 
@@ -457,6 +462,208 @@ where
     }
     pub(crate) fn current_max_recv_streams(&self) -> usize {
         self.h2_tx.current_max_recv_streams()
+    }
+
+    /// A handle that sends requests on this connection from the caller's task.
+    pub(crate) fn direct_send(&mut self) -> DirectSend<B> {
+        let (pipe_tx, pipe_rx) = mpsc::unbounded();
+        self.pipe_rx = Some(pipe_rx);
+        DirectSend {
+            h2_tx: self.h2_tx.clone(),
+            ping: self.ping.clone(),
+            pipe_tx,
+        }
+    }
+}
+
+/// Sends requests without the dispatch task: the caller's `send` writes the
+/// request head into h2, and the future it gets drives the request body and
+/// waits for the response in the caller's task, where `ClientTask` spawns a
+/// task for each.
+pub(crate) struct DirectSend<B>
+where
+    B: Body,
+{
+    h2_tx: SendRequest<SendBuf<B::Data>>,
+    ping: ping::Recorder,
+    pipe_tx: mpsc::UnboundedSender<PipeToSendStream<B>>,
+}
+
+/// What a direct send did with the request.
+pub(crate) enum Direct<B>
+where
+    B: Body,
+{
+    Sent(DirectResponse<B>),
+    /// Not sent: the dispatch task has to take it (CONNECT, or the handle's
+    /// last stream is still waiting for the peer's stream limit).
+    Dispatch(Request<B>),
+    /// Not sent: the connection has failed or is shutting down.
+    Closed,
+    /// h2 refused the request.
+    Failed(crate::Error),
+}
+
+/// A `DirectSend<B>` as `client::conn::http2::SendRequest<B>` holds it: that
+/// type has no `Body` bound, so it cannot name `B::Data`.
+pub(crate) trait AnyDirectSend: Send + Sync {
+    fn clone_box(&self) -> Box<dyn AnyDirectSend>;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+impl<B> AnyDirectSend for DirectSend<B>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+{
+    fn clone_box(&self) -> Box<dyn AnyDirectSend> {
+        Box::new(self.clone())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl<B> Clone for DirectSend<B>
+where
+    B: Body,
+{
+    fn clone(&self) -> Self {
+        DirectSend {
+            h2_tx: self.h2_tx.clone(),
+            ping: self.ping.clone(),
+            pipe_tx: self.pipe_tx.clone(),
+        }
+    }
+}
+
+impl<B> DirectSend<B>
+where
+    B: Body,
+{
+    pub(crate) fn send(&mut self, req: Request<B>) -> Direct<B> {
+        if req.method() == Method::CONNECT {
+            return Direct::Dispatch(req);
+        }
+        match self.h2_tx.is_ready() {
+            Ok(true) => (),
+            Ok(false) => return Direct::Dispatch(req),
+            Err(_err) => {
+                debug!("connection was not ready: {}", _err);
+                return Direct::Closed;
+            }
+        }
+
+        // The request head, as `ClientTask` prepares it.
+        let (head, body) = req.into_parts();
+        let mut req = ::http::Request::from_parts(head, ());
+        super::strip_connection_headers(req.headers_mut(), true);
+        if let Some(len) = body.size_hint().exact() {
+            if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
+                headers::set_content_length_if_missing(req.headers_mut(), len);
+            }
+        }
+        let eos = body.is_end_stream();
+        if let Some(protocol) = req.extensions_mut().remove::<Protocol>() {
+            req.extensions_mut().insert(protocol.into_inner());
+        }
+
+        let (fut, body_tx) = match self.h2_tx.send_request(req, eos) {
+            Ok(ok) => ok,
+            Err(err) => {
+                debug!("client send request error: {}", err);
+                return Direct::Failed(crate::Error::new_h2(err));
+            }
+        };
+
+        let pipe = (!eos).then(|| PipeToSendStream::new(body, body_tx));
+        Direct::Sent(DirectResponse {
+            fut,
+            pipe_tx: pipe.is_some().then(|| self.pipe_tx.clone()),
+            pipe,
+            ping: Some(self.ping.clone()),
+        })
+    }
+}
+
+pin_project! {
+    /// The response to a direct send. Dropping it before the response cancels
+    /// the request (RST_STREAM `CANCEL`).
+    pub(crate) struct DirectResponse<B>
+    where
+        B: Body,
+    {
+        #[pin]
+        fut: ResponseFuture,
+        // The request body, until it is sent.
+        pipe: Option<PipeToSendStream<B>>,
+        pipe_tx: Option<mpsc::UnboundedSender<PipeToSendStream<B>>>,
+        ping: Option<Recorder>,
+    }
+
+    impl<B> PinnedDrop for DirectResponse<B>
+    where
+        B: Body,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            if let Some(pipe) = this.project().pipe.as_mut() {
+                debug!("client request cancelled or failed, resetting stream");
+                pipe.reset(h2::Reason::CANCEL);
+            }
+        }
+    }
+}
+
+impl<B> Future for DirectResponse<B>
+where
+    B: Body + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Output = crate::Result<Response<IncomingBody>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        if let Some(pipe) = this.pipe.as_mut() {
+            if let Poll::Ready(result) = Pin::new(pipe).poll(cx) {
+                if let Err(_e) = result {
+                    debug!("client request body error: {}", _e);
+                }
+                *this.pipe = None;
+                *this.pipe_tx = None;
+            }
+        }
+
+        let result = ready!(this.fut.poll(cx));
+        let ping = this.ping.take().expect("Future polled twice");
+
+        match result {
+            Ok(res) => {
+                // record that we got the response headers
+                ping.record_non_data();
+
+                // A body that outlives the response head (a streaming
+                // request) continues in a task of the dispatch task's
+                // executor.
+                if let (Some(pipe), Some(tx)) = (this.pipe.take(), this.pipe_tx.take()) {
+                    let _ = tx.unbounded_send(pipe);
+                }
+
+                let content_length = headers::content_length_parse_all(res.headers());
+                let res = res.map(|stream| {
+                    let ping = ping.for_stream(&stream);
+                    IncomingBody::h2(stream, content_length.into(), ping)
+                });
+                Poll::Ready(Ok(res))
+            }
+            Err(err) => {
+                ping.ensure_not_timed_out()?;
+
+                debug!("client response error: {}", err);
+                Poll::Ready(Err(crate::Error::new_h2(err)))
+            }
+        }
     }
 }
 
@@ -681,6 +888,23 @@ where
     type Output = crate::Result<Dispatched>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        while let Some(pipe_rx) = self.pipe_rx.as_mut() {
+            match Pin::new(pipe_rx).poll_next(cx) {
+                Poll::Ready(Some(pipe)) => {
+                    let pipe = PipeMap {
+                        pipe,
+                        conn_drop_ref: Some(self.conn_drop_ref.clone()),
+                        ping: Some(self.ping.clone()),
+                        cancel_rx: None,
+                    };
+                    self.executor
+                        .execute_h2_future(H2ClientFuture::Pipe { pipe });
+                }
+                Poll::Ready(None) => self.pipe_rx = None,
+                Poll::Pending => break,
+            }
+        }
+
         loop {
             match ready!(self.h2_tx.poll_ready(cx)) {
                 Ok(()) => (),
@@ -780,12 +1004,14 @@ where
                     continue;
                 }
 
-                Poll::Ready(None) => {
+                Poll::Ready(None) if self.pipe_rx.is_none() => {
                     trace!("client::dispatch::Sender dropped");
                     return Poll::Ready(Ok(Dispatched::Shutdown));
                 }
 
-                Poll::Pending => match ready!(Pin::new(&mut self.conn_eof).poll(cx)) {
+                // With every sender dropped, a direct send in flight may
+                // still hand its body over.
+                Poll::Ready(None) | Poll::Pending => match ready!(Pin::new(&mut self.conn_eof).poll(cx)) {
                     // As of Rust 1.82, this pattern is no longer needed, and emits a warning.
                     // But we cannot remove it as long as MSRV is less than that.
                     #[allow(unused)]

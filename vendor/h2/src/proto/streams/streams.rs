@@ -1004,6 +1004,21 @@ where
         }
         Poll::Ready(Ok(()))
     }
+
+    /// `poll_pending_open` without registering a waker: whether `pending` is
+    /// still waiting to open.
+    pub fn is_pending_open(
+        &self,
+        pending: Option<&OpaqueStreamRef>,
+    ) -> Result<bool, crate::Error> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        me.actions.ensure_no_conn_error()?;
+        me.actions.send.ensure_next_stream_id()?;
+
+        Ok(pending.is_some_and(|pending| me.store.resolve(pending.key).is_pending_open))
+    }
 }
 
 impl<B, P> Streams<B, P>

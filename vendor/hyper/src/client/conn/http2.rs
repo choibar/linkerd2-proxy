@@ -17,20 +17,35 @@ use super::super::dispatch::{self, TrySendError};
 use crate::body::{Body, Incoming as IncomingBody};
 use crate::common::time::Time;
 use crate::proto;
+use crate::proto::h2::client::{AnyDirectSend, Direct, DirectResponse, DirectSend};
 use crate::rt::bounds::Http2ClientConnExec;
 use crate::rt::Timer;
 
 /// The sender side of an established connection.
 pub struct SendRequest<B> {
     dispatch: dispatch::UnboundedSender<Request<B>, Response<IncomingBody>>,
+    // A `DirectSend<B>`, once `Connection::direct_send` enabled it.
+    direct: Option<Box<dyn AnyDirectSend>>,
 }
 
 impl<B> Clone for SendRequest<B> {
     fn clone(&self) -> SendRequest<B> {
         SendRequest {
             dispatch: self.dispatch.clone(),
+            direct: self.direct.as_ref().map(|direct| direct.clone_box()),
         }
     }
+}
+
+/// A request on its way out of `SendRequest::send_request`.
+enum Sent<B>
+where
+    B: Body,
+{
+    Direct(DirectResponse<B>),
+    Dispatch(Result<dispatch::Promise<Response<IncomingBody>>, Request<B>>),
+    Closed,
+    Failed(crate::Error),
 }
 
 /// A future that processes all HTTP state for the IO object.
@@ -150,22 +165,41 @@ where
     pub fn send_request(
         &mut self,
         req: Request<B>,
-    ) -> impl Future<Output = crate::Result<Response<IncomingBody>>> {
-        let sent = self.dispatch.send(req);
+    ) -> impl Future<Output = crate::Result<Response<IncomingBody>>>
+    where
+        B: Unpin,
+        B::Error: Into<Box<dyn Error + Send + Sync>>,
+    {
+        let direct = self
+            .direct
+            .as_mut()
+            .and_then(|direct| direct.as_any_mut().downcast_mut::<DirectSend<B>>());
+        let sent = match direct {
+            // A closed dispatch task refuses the request on either path.
+            Some(direct) if !self.dispatch.is_closed() => match direct.send(req) {
+                Direct::Sent(fut) => Sent::Direct(fut),
+                Direct::Dispatch(req) => Sent::Dispatch(self.dispatch.send(req)),
+                Direct::Closed => Sent::Closed,
+                Direct::Failed(err) => Sent::Failed(err),
+            },
+            _ => Sent::Dispatch(self.dispatch.send(req)),
+        };
 
         async move {
             match sent {
-                Ok(rx) => match rx.await {
+                Sent::Direct(fut) => fut.await,
+                Sent::Dispatch(Ok(rx)) => match rx.await {
                     Ok(Ok(resp)) => Ok(resp),
                     Ok(Err(err)) => Err(err),
                     // this is definite bug if it happens, but it shouldn't happen!
                     Err(_canceled) => panic!("dispatch dropped without returning error"),
                 },
-                Err(_req) => {
+                Sent::Dispatch(Err(_)) | Sent::Closed => {
                     debug!("connection was not ready");
 
                     Err(crate::Error::new_canceled().with("connection was not ready"))
                 }
+                Sent::Failed(err) => Err(err),
             }
         }
     }
@@ -251,6 +285,27 @@ where
     /// [1]: https://datatracker.ietf.org/doc/html/rfc7540#section-5.1.2
     pub fn current_max_recv_streams(&self) -> usize {
         self.inner.1.current_max_recv_streams()
+    }
+
+    /// Makes `tx` and its clones send requests from the task that calls
+    /// [`SendRequest::send_request`].
+    ///
+    /// By default a request goes through this connection's dispatch task,
+    /// which spawns a task that waits for the response and, for a request
+    /// with a body, one that sends it. A direct send writes the request head
+    /// into the HTTP/2 connection inside `send_request`; the returned future
+    /// sends the body and waits for the response. This `Connection` must
+    /// still be polled: it sends CONNECT requests, requests that have to wait
+    /// for the peer's concurrent stream limit and those of
+    /// `try_send_request`, and it spawns the body of a request whose response
+    /// arrives before the body ends.
+    ///
+    /// Call it once, with a `SendRequest` of this connection.
+    pub fn direct_send(&mut self, tx: &mut SendRequest<B>)
+    where
+        B: Send,
+    {
+        tx.direct = Some(Box::new(self.inner.1.direct_send()));
     }
 }
 
@@ -580,6 +635,7 @@ where
             Ok((
                 SendRequest {
                     dispatch: tx.unbound(),
+                    direct: None,
                 },
                 Connection {
                     inner: (PhantomData, h2),

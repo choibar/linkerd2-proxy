@@ -373,6 +373,19 @@ where
         Poll::Ready(Ok(()))
     }
 
+    /// Whether [`send_request`] may be called now: `poll_ready` as a plain
+    /// check. It registers no waker, so a caller that shares its task with the
+    /// stream's body sender does not take over the stream's send wakeup.
+    ///
+    /// [`send_request`]: #method.send_request
+    pub fn is_ready(&mut self) -> Result<bool, crate::Error> {
+        if self.inner.is_pending_open(self.pending.as_ref())? {
+            return Ok(false);
+        }
+        self.pending = None;
+        Ok(true)
+    }
+
     /// Consumes `self`, returning a future that returns `self` back once it is
     /// ready to send a request.
     ///
