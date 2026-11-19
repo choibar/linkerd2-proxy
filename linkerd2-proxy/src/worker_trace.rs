@@ -43,9 +43,9 @@ mod tests {
 
     #[test]
     fn rejects_invalid_scope() {
-        assert_eq!(Scope::parse("worker").unwrap(), Scope::Worker);
+        assert_eq!(Scope::parse("private").unwrap(), Scope::Private);
         assert_eq!(Scope::parse("shared").unwrap(), Scope::Shared);
-        assert!(Scope::parse("private").is_err());
+        assert!(Scope::parse("worker").is_err());
     }
 
     #[test]

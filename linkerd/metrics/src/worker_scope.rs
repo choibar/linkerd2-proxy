@@ -3,16 +3,16 @@
 pub enum WorkerScope {
     #[default]
     Shared,
-    Worker,
+    Private,
 }
 
 impl WorkerScope {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim() {
             "shared" => Ok(Self::Shared),
-            "worker" => Ok(Self::Worker),
+            "private" => Ok(Self::Private),
             other => Err(format!(
-                "DPUMESH_L7_TRACE_SCOPE must be shared or worker, got {other:?}"
+                "DPUMESH_L7_TRACE_SCOPE must be shared or private, got {other:?}"
             )),
         }
     }
@@ -21,7 +21,7 @@ impl WorkerScope {
         let sharded = std::env::var_os("DMESH_SHARDED").is_some();
         let value = match std::env::var("DPUMESH_L7_TRACE_SCOPE") {
             Ok(value) => value,
-            Err(std::env::VarError::NotPresent) => if sharded { "worker" } else { "shared" }.into(),
+            Err(std::env::VarError::NotPresent) => if sharded { "private" } else { "shared" }.into(),
             Err(error) => return Err(error.to_string()),
         };
         Self::for_sharded(&value, sharded)
@@ -29,8 +29,8 @@ impl WorkerScope {
 
     pub fn for_sharded(value: &str, sharded: bool) -> Result<Self, String> {
         let scope = Self::parse(value)?;
-        if scope == Self::Worker && !sharded {
-            return Err("DPUMESH_L7_TRACE_SCOPE=worker requires DMESH_SHARDED".into());
+        if scope == Self::Private && !sharded {
+            return Err("DPUMESH_L7_TRACE_SCOPE=private requires DMESH_SHARDED".into());
         }
         Ok(scope)
     }
@@ -43,14 +43,14 @@ mod tests {
     #[test]
     fn validates_shared_configuration_for_both_tracing_and_metrics() {
         assert_eq!(
-            WorkerScope::for_sharded("worker", true).unwrap(),
-            WorkerScope::Worker
+            WorkerScope::for_sharded("private", true).unwrap(),
+            WorkerScope::Private
         );
         assert_eq!(
             WorkerScope::for_sharded(" shared ", false).unwrap(),
             WorkerScope::Shared
         );
-        assert!(WorkerScope::for_sharded("worker", false).is_err());
-        assert!(WorkerScope::for_sharded("private", true).is_err());
+        assert!(WorkerScope::for_sharded("private", false).is_err());
+        assert!(WorkerScope::for_sharded("worker", true).is_err());
     }
 }

@@ -83,15 +83,16 @@ datapath metrics. The existing option name is retained for compatibility.
 
 | Configuration | Tracing subscriber | Datapath metrics |
 | --- | --- | --- |
-| `DMESH_SHARDED=1 DPUMESH_L7_TRACE_SCOPE=worker` | Independent per worker | Independent per worker; combined during `/metrics` scrapes |
+| `DMESH_SHARDED=1 DPUMESH_L7_TRACE_SCOPE=private` | Independent per worker | Independent per worker; combined during `/metrics` scrapes |
 | `DMESH_SHARDED=1 DPUMESH_L7_TRACE_SCOPE=shared` | Shared | Shared |
 
-With `DMESH_SHARDED` set, the default scope is `worker`; otherwise it is
-`shared`. Explicit `worker` scope requires `DMESH_SHARDED`. As with the
-existing sharded runtime option, presence of `DMESH_SHARDED` enables it.
+With `DMESH_SHARDED` set, the default scope is `private`; otherwise it is
+`shared`. Explicit `private` scope requires `DMESH_SHARDED`; the former `worker`
+value is rejected. As with the existing sharded runtime option, presence of
+`DMESH_SHARDED` enables it.
 `DMESH_TOKIO_CONSOLE` forces shared scope when console support is compiled in.
 
-Worker scope creates new legacy HTTP/transport/stack/error metric stores and
+Private scope creates new legacy HTTP/transport/stack/error metric stores and
 new Prometheus metric families before constructing each worker's outbound
 stack. Cloning a stack within a worker shares only that worker's stores.
 Control clients, identity, ordinary TCP listeners, and process/runtime metrics

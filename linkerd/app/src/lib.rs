@@ -136,7 +136,7 @@ impl Config {
         BAdmin: Bind<ServerConfig, BoundAddrs = Local<ServerAddr>> + Clone + 'static,
         BAdmin::Addrs: Param<Remote<ClientAddr>> + Param<Local<ServerAddr>> + Param<AddrPair>,
     {
-        let worker_metrics = self.worker_scope == metrics::WorkerScope::Worker;
+        let worker_metrics = self.worker_scope == metrics::WorkerScope::Private;
         let worker_reports = metrics::legacy::Aggregate::default();
         let Config {
             admin,
