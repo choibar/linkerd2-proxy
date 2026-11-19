@@ -90,6 +90,8 @@ impl<T> Outbound<svc::ArcNewHttp<T, http::BoxBody>> {
             // Initiates an HTTP client on the underlying transport. Prior-knowledge HTTP/2
             // is typically used (i.e. when communicating with other proxies); though
             // HTTP/1.x fallback is supported as needed.
+            #[cfg(feature = "doca")]
+            let inner = inner.push_on_service(svc::layer::mk(super::dmesh_origin::Scoped::new));
             let inner = inner
                 // Drive the connection to completion regardless of whether the reconnect is being
                 // actively polled.

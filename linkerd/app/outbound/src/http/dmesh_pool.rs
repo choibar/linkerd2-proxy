@@ -140,8 +140,16 @@ where
     fn new_service(&self, target: T) -> Self::Service {
         let Remote(ServerAddr(address)) = target.param();
         let params: http::client::Params = target.param();
+        if dmesh_doca::peer::is_remote(address) {
+            return super::dmesh_remote_pool::new(self.0.clone(), target, self.1);
+        }
         if !dmesh_doca::backend::is_dma(&address) || !matches!(params, http::client::Params::H2(_))
         {
+            if matches!(params, http::client::Params::H2(_))
+                && std::env::var_os("DPUMESH_PEER_RDMA_DEVICE").is_some_and(|v| !v.is_empty())
+            {
+                return super::dmesh_remote_pool::unclassified(self.0.clone(), target, self.1);
+            }
             return self.0.new_service(target);
         }
         let tls: tls::ConditionalClientTls = target.param();

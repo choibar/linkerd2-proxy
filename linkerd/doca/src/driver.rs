@@ -71,7 +71,6 @@ extern "C" {
     ) -> c_int;
     // Update the DPA's consumed position to return DPU RX staging space.
     fn dmesh_doca_conn_update_dpu_rx_consumed_pos(objs: *mut c_void, slot: i32, pos: u32) -> i32;
-    fn dmesh_doca_conn_recv_release(objs: *mut c_void, slot: i32, pos: u32, len: u32) -> c_int;
     // Flow mode of a slot: 1 = backend provider, otherwise a client flow.
     fn dmesh_doca_conn_mode_get(objs: *mut c_void, slot: i32) -> i32;
     // Report the connection's mapped tx_staging region (usable base + len) so
@@ -148,6 +147,8 @@ pub struct FlowId {
     pub dst: std::net::SocketAddrV4,
     /// Source workload identity (pod / service-account) for policy & telemetry.
     pub workload: String,
+    /// Full identity copied from the verified registration, when enabled.
+    pub origin: Option<crate::PeerOrigin>,
     /// True for a BACKEND-mode connection: the host end provides the service
     /// at `dst`; the connector reaches it through this channel instead of TCP.
     pub is_backend: bool,
@@ -237,6 +238,8 @@ pub type Registration = (usize, FlowKey, FlowLocation, crate::DmeshIoHandle);
 pub type Registrar = mpsc::UnboundedSender<Registration>;
 
 pub struct Driver {
+    // Detach staging readers before dropping the C device domain.
+    peer: Option<crate::peer::PeerDriver>,
     doca: DmeshDoca,
     events: mpsc::UnboundedSender<DmeshEvent>,
     reg_rx: mpsc::UnboundedReceiver<Registration>,
@@ -291,6 +294,7 @@ impl Driver {
         let (reg_tx, reg_rx) = mpsc::unbounded_channel();
         const NONE: Option<crate::DmeshIoHandle> = None;
         let driver = Self {
+            peer: unsafe { crate::peer::PeerDriver::new(doca.raw(), dmesh_doca_worker_id(doca.raw()) as usize) },
             doca,
             events,
             reg_rx,
@@ -531,7 +535,9 @@ impl Driver {
             let Some(p) = handle.take_qdelay() else {
                 continue;
             };
-            let flow = self.conn_flow(slot);
+            let Some(flow) = self.conn_flow(slot) else {
+                continue;
+            };
             eprintln!(
                 "[dmesh-qdelay] unix_ns={unix_ns} worker={worker} slot={slot} flow={}/{} backend={} src={} dst={} rx {} tx {} rxh={} txh={}",
                 flow.key.session_id,
@@ -548,7 +554,7 @@ impl Driver {
     }
 
     /// Read the flow identity the host reported for a slot's connection.
-    fn conn_flow(&self, slot: usize) -> FlowId {
+    fn conn_flow(&self, slot: usize) -> Option<FlowId> {
         let (mut src_ip, mut dst_ip) = (0u32, 0u32);
         let (mut src_port, mut dst_port) = (0u16, 0u16);
         let mut workload = [0i8 as std::os::raw::c_char; 64];
@@ -564,21 +570,28 @@ impl Driver {
                 workload.len() as i32,
             );
         }
-        let workload = unsafe { std::ffi::CStr::from_ptr(workload.as_ptr()) }
+        let mut workload = unsafe { std::ffi::CStr::from_ptr(workload.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        let origin = unsafe { crate::origin::read(self.doca.raw(), slot) }.ok()?;
+        // A verified or revoked registration must never inherit the Host's
+        // legacy identity string. Authorization can use the verified fields.
+        if origin.is_some() {
+            workload.clear();
+        }
         // inet_addr() stores the address bytes in network order in memory;
         // both PCIe endpoints are little-endian, so the raw u32's LE bytes
         // are exactly the network-order octets.
         let is_backend = unsafe { dmesh_doca_conn_mode_get(self.doca.raw(), slot as i32) } == 1;
-        FlowId {
+        Some(FlowId {
             key: self.identity(slot).0,
             location: self.identity(slot).1,
             src: std::net::SocketAddrV4::new(src_ip.to_le_bytes().into(), src_port),
             dst: std::net::SocketAddrV4::new(dst_ip.to_le_bytes().into(), dst_port),
             workload,
+            origin,
             is_backend,
-        }
+        })
     }
 
     fn identity(&self, slot: usize) -> (FlowKey, FlowLocation) {
@@ -626,7 +639,10 @@ impl Driver {
             self.conn_states[slot] = cur;
 
             let ev = match cur {
-                ConnState::Running => Some(DmeshEvent::ConnReady(slot, self.conn_flow(slot))),
+                ConnState::Running => Some(match self.conn_flow(slot) {
+                    Some(flow) => DmeshEvent::ConnReady(slot, flow),
+                    None => DmeshEvent::ConnDraining(slot),
+                }),
                 ConnState::Error => Some(DmeshEvent::ConnError(slot)),
                 ConnState::Closing => Some(DmeshEvent::ConnDraining(slot)),
                 ConnState::Free if prev != ConnState::Free => Some(DmeshEvent::ConnClosed(slot)),
@@ -716,6 +732,9 @@ impl Driver {
             .map_err(|e| Error::new(-1, format!("register ctrl fd: {e}")))?;
         let data = AsyncFd::with_interest(PeFd(data_fd), Interest::READABLE)
             .map_err(|e| Error::new(-1, format!("register data fd: {e}")))?;
+        let peer_fds = self.peer.as_ref().map(|p| p.fds()).transpose()
+            .map_err(|e| Error::new(-1, format!("register peer fd: {e}")))?;
+        let peer_wake = self.peer.as_ref().map(|p| p.wake.clone());
 
         let mut stats_last = Instant::now();
         let mut stats_prev = self.stats();
@@ -770,6 +789,10 @@ impl Driver {
             self.pump_recv();
             self.pump_tx_completions()?;
             self.pump_send();
+            if let Some(peer) = self.peer.as_mut() {
+                peer.disarm();
+                peer.progress().map_err(|e| Error::new(-1, format!("peer progress: {e}")))?;
+            }
             // Staging flow control: tell each slot's DPA thread how far the
             // reader got, so it can reuse the staging ring behind it.
             for slot in 0..MAX_CONNS {
@@ -802,7 +825,20 @@ impl Driver {
                 continue;
             }
 
+            // ARM MsgQ arm -> final progress -> sleep closes the lost-wakeup
+            // window. Carrier CQ and manager mailboxes retain their readiness.
+            if let Some(peer) = self.peer.as_mut() {
+                peer.arm().map_err(|e| Error::new(-1, e.to_string()))?;
+                peer.progress().map_err(|e| Error::new(-1, e.to_string()))?;
+            }
+
             tokio::select! {
+                result = async {
+                    match &peer_fds { Some(fds) => fds.wait().await, None => std::future::pending().await }
+                } => { result.map_err(|e| Error::new(-1, e.to_string()))?; }
+                _ = async {
+                    match &peer_wake { Some(wake) => wake.notified().await, None => std::future::pending().await }
+                } => {}
                 guard = ctrl.readable() => {
                     let mut guard = guard.map_err(|e| Error::new(-1, format!("ctrl fd wait: {e}")))?;
                     guard.clear_ready();
@@ -825,6 +861,9 @@ impl Driver {
                 // sat in tx for a full timer period (~2ms epoll rounding of the
                 // 1ms sleep) - 81% of single-stream request latency.
                 _ = std::future::poll_fn(|cx| {
+                    if let Some(peer) = self.peer.as_mut() {
+                        if peer.poll_ready(cx).is_ready() { return std::task::Poll::Ready(()); }
+                    }
                     for h in self.handles.iter().flatten() {
                         if h.poll_driver_ready(cx).is_ready() {
                             return std::task::Poll::Ready(());

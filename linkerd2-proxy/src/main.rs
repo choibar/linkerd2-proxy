@@ -20,6 +20,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod rt;
 #[cfg(feature = "doca")]
 mod taskstat;
+#[cfg(any(feature = "doca", test))]
+mod worker_trace;
 
 const EX_USAGE: i32 = 64;
 
@@ -52,6 +54,22 @@ fn main() {
     };
     #[cfg(not(feature = "tokio-console"))]
     let trace = init_linkerd_trace();
+
+    #[cfg(feature = "doca")]
+    let worker_scope = match worker_trace::Scope::from_env() {
+        Ok(scope) => scope,
+        Err(error) => {
+            eprintln!("Invalid worker observability configuration: {error}");
+            std::process::exit(EX_USAGE);
+        }
+    };
+    // Console owns the diagnostic subscriber and must see all worker tasks.
+    #[cfg(all(feature = "doca", feature = "tokio-console"))]
+    let worker_scope = if std::env::var_os("DMESH_TOKIO_CONSOLE").is_some() {
+        worker_trace::Scope::Shared
+    } else {
+        worker_scope
+    };
 
     info!(
         "{profile} {version} ({sha}) by {vendor} on {date}",
@@ -132,6 +150,8 @@ fn main() {
             std::process::exit(EX_USAGE);
         }
     };
+    #[cfg(feature = "doca")]
+    let config = config.with_worker_scope(worker_scope);
 
     // Builds a runtime with the appropriate number of cores:
     // `LINKERD2_PROXY_CORES` env or the number of available CPUs (as provided
@@ -176,6 +196,8 @@ fn main() {
 
         let bind_in = BindTcp::with_orig_dst();
         let bind_out = BindTcp::dual_with_orig_dst();
+        #[cfg(feature = "doca")]
+        let worker_trace_parent = trace.clone();
         let app = match config
             .build(
                 bind_in,
@@ -217,11 +239,24 @@ fn main() {
         }
         #[cfg(feature = "doca")]
         for (i, driver, dmesh_rx, registrar) in dmesh_shards {
-            let serve = app.dmesh_serve_future(i, dmesh_rx, registrar);
+            let worker_trace =
+                worker_trace::WorkerTrace::new(worker_scope, &worker_trace_parent)
+                    .unwrap_or_else(|error| {
+                        eprintln!("Worker {i} tracing initialization failed: {error}");
+                        std::process::exit(EX_USAGE);
+                    });
+            // This constructor creates the outer dmesh span now, before spawn.
+            // It must capture the same subscriber used to poll it on the worker.
+            let serve = {
+                let _trace_guard = worker_trace.enter();
+                app.dmesh_serve_future(i, dmesh_rx, registrar)
+            };
             let core = worker_cores[i];
             std::thread::Builder::new()
                 .name(format!("dmesh-shard-{i}"))
                 .spawn(move || {
+                    // Keep the dispatcher through runtime/task destruction.
+                    let _trace_guard = worker_trace.enter();
                     if !dmesh_doca::pin_current_thread_to_core(core) {
                         warn!(worker = i, core, "dmesh shard: failed to pin core");
                     }

@@ -18,13 +18,14 @@ fn main() {
     let build_dir = transport.join("build");
 
     println!("cargo:rerun-if-changed=src/shim.c");
-    for dir in ["common", "dpu", "host"] {
+    for dir in ["common", "dpu", "host", "peer"] {
         println!("cargo:rerun-if-changed={}", transport.join(dir).display());
     }
     for archive in [
         "libdmesh_dpu.a",
         "libdmesh_common.a",
         "libdmesh_host.a",
+        "peer/libdmesh_peer.a",
         "device/dpa_kernel.a",
     ] {
         println!("cargo:rerun-if-changed={}", build_dir.join(archive).display());
@@ -38,6 +39,12 @@ fn main() {
         "doca-sha",
         "doca-dpa",
         "libflexio",
+        "doca-rdma",
+        "doca-verbs",
+        "libibverbs",
+        "librdmacm",
+        "libssl",
+        "libcrypto",
     ];
 
     let mut include_paths = BTreeSet::new();
@@ -64,6 +71,7 @@ fn main() {
         build.include(transport.join(dir));
     }
 
+    build.include(transport.join("peer"));
     build.compile("dmesh_doca_shim");
 
     // Copy the archives next to the shim so one link-search path covers them;
@@ -76,6 +84,7 @@ fn main() {
         ("libdmesh_dpu.a", "libdmesh_dpu.a"),
         ("libdmesh_common.a", "libdmesh_common.a"),
         ("libdmesh_host.a", "libdmesh_host.a"),
+        ("peer/libdmesh_peer.a", "libdmesh_peer.a"),
         ("device/dpa_kernel.a", "libdpa_kernel.a"),
     ] {
         let from = build_dir.join(source).canonicalize().unwrap_or_else(|error| {
@@ -94,7 +103,9 @@ fn main() {
     println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_dpu");
     println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_common");
     println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_host");
+    println!("cargo:rustc-link-lib=static:+whole-archive=dmesh_peer");
     println!("cargo:rustc-link-lib=static:+whole-archive=dpa_kernel");
+    println!("cargo:rustc-link-lib=dl");
     // SDK libraries must follow the archives that reference them. Emitting
     // these first lets --as-needed discard constructor-only dependencies in
     // standalone crate tests (DOCA logging and the dpacc registration stubs).

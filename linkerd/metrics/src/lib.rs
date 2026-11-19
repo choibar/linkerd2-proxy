@@ -3,6 +3,7 @@
 
 //! Utilities for exposing metrics to Prometheus.
 
+mod aggregate;
 mod counter;
 mod fmt;
 mod gauge;
@@ -12,6 +13,8 @@ pub mod latency;
 mod new_metrics;
 mod serve;
 mod store;
+mod worker_scope;
+pub use worker_scope::WorkerScope;
 
 #[cfg(feature = "process")]
 pub use kubert_prometheus_process as process;
@@ -25,6 +28,7 @@ pub mod legacy {
     // this will help us differentiate in dependent systems which components rely on our legacy
     // metrics implementation.
     pub use super::{
+        aggregate::{Aggregate, Aggregated},
         counter::Counter,
         fmt::{FmtLabels, FmtMetric, FmtMetrics, Metric},
         gauge::Gauge,

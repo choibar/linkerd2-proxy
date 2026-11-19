@@ -8,6 +8,9 @@ use std::{
 mod driver;
 pub mod flowstats;
 pub mod pmu;
+pub mod origin;
+pub mod peer;
+pub use origin::PeerOrigin;
 mod io;
 
 pub use driver::{

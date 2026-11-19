@@ -894,6 +894,7 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
     let identity = self::identity::parse_identity_config(strings, &inbound, &outbound)?;
 
     Ok(super::Config {
+        worker_scope: super::metrics::WorkerScope::Shared,
         admin,
         dns,
         dst,

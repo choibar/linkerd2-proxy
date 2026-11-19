@@ -7,6 +7,8 @@ use std::fmt;
 use tokio::time;
 use tracing::info_span;
 
+mod dispatch;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub addr: ControlAddr,
@@ -67,7 +69,8 @@ impl fmt::Display for ControlAddr {
     }
 }
 
-pub type RspBody = linkerd_http_metrics::requests::ResponseBody<
+pub type RspBody = dispatch::Scoped<ControlBody>;
+type ControlBody = linkerd_http_metrics::requests::ResponseBody<
     http::balance::Body<hyper::body::Incoming>,
     classify::Eos,
 >;
@@ -137,11 +140,17 @@ impl Config {
             .push(legacy_metrics.to_layer::<classify::Response, _, _>())
             .push(classify::NewClassify::layer_default());
 
-        balance
+        let control = balance
             .push(self::add_origin::layer())
             .push(svc::NewMapErr::layer_from_target::<ControlError, _>())
             .instrument(|c: &ControlAddr| info_span!("controller", addr = %c.addr))
             .push_map_target(move |()| addr.clone())
+            .into_inner();
+
+        // Control services are shared with workers that may have independent
+        // subscribers. Keep their existing spans (including response bodies
+        // and cancellation) under their original dispatcher.
+        svc::stack(dispatch::Scoped::new(control))
             .push_on_service(svc::BoxCloneSyncService::layer())
             .push(svc::ArcNewService::layer())
             .into_inner()

@@ -26,6 +26,7 @@
 #include "dpa_common.h"
 #include "dpa_mux.h"
 #include "ring.h"
+#include "peer_node.h"
 
 struct dmesh_doca_probe_report {
 	uint32_t device_count;
@@ -613,6 +614,11 @@ void dmesh_doca_comch_destroy(struct objects *handle)
 	if (handle == NULL)
 		return;
 
+    if (peer_node_worker_stop(handle->peer_worker)) {
+        fprintf(stderr, "[DMesh] retaining worker with live peer connections/DMA\n");
+        return;
+    }
+
     if (!dmesh_dispatch_worker_stop_admission(handle)) {
         fprintf(stderr, "[DMesh] retaining worker with pending control commands\n");
         return;
@@ -645,10 +651,41 @@ void dmesh_doca_comch_destroy(struct objects *handle)
 
 /* Existing Comch names remain control aliases. Each data worker opens its own
  * device reference and never owns a Comch server/control PE. */
+static int peer_group_start(struct local_control_session *local_control, struct objects **workers,
+                             size_t count, void **out)
+{
+    struct doca_dev *devices[128];
+    for (size_t i = 0; i < count; ++i) devices[i] = workers[i]->dev;
+    struct peer_node *node = NULL;
+    int error = peer_node_new(local_control, devices, (unsigned)count,
+                              dmesh_dispatch_listener_live, &node);
+    *out = node;
+    if (!error)
+        for (size_t i = 0; i < count; ++i)
+            workers[i]->peer_worker = peer_node_worker(node, (unsigned)i);
+    return error;
+}
+static void peer_group_progress(void *node) { peer_node_control_progress(node); }
+static int peer_group_free(void **node)
+{
+    struct peer_node *n = *node;
+    int error = peer_node_free(&n);
+    *node = n;
+    return error;
+}
+static const struct dmesh_dispatch_peer_ops peer_group_ops = {
+    .start = peer_group_start, .progress = peer_group_progress, .free = peer_group_free,
+};
+
 int32_t dmesh_doca_group_init(const char *dev, const char *rep, const char *name,
                              uint32_t count, struct objects **out)
 {
     if (!out || !count || count > 128) return DOCA_ERROR_INVALID_VALUE;
+    static int peer_ops_set;
+    if (!peer_ops_set) {
+        if (dmesh_dispatcher_set_peer_ops(&peer_group_ops)) return DOCA_ERROR_INITIALIZATION;
+        peer_ops_set = 1;
+    }
     memset(out, 0, count * sizeof(*out));
     struct objects **controls = calloc(count, sizeof(*controls));
     if (!controls) return DOCA_ERROR_NO_MEMORY;
@@ -697,3 +734,6 @@ int32_t dmesh_doca_conn_identity(struct objects *o, int slot,
 int dmesh_doca_worker_id(struct objects *o) { return o->worker_idx; }
 int dmesh_doca_request_backend(struct objects *o, uint32_t ip, uint16_t port)
 { return dmesh_dispatch_backend_request(o, ip, port); }
+
+struct peer_node_worker *dmesh_doca_peer_worker(struct objects *o)
+{ return o ? o->peer_worker : NULL; }

@@ -116,6 +116,7 @@ mod seg_cache {
             return;
         }
         static N: AtomicU64 = AtomicU64::new(0);
+        #[cfg(target_arch = "aarch64")]
         static TICKS: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Relaxed);
         if n % 64 != 0 {
@@ -261,6 +262,15 @@ use linkerd_io::{Peek, PeerAddr};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Default)]
+struct TxChunk {
+    token: u32,
+    base: usize,
+    capacity: usize,
+    written: usize,
+    sealed: bool,
+}
+
+#[derive(Default)]
 struct Inner {
     /// Owned received bytes (copy path; used by tests and any non-DMA push).
     rx: Vec<u8>,
@@ -297,6 +307,11 @@ struct Inner {
     tx_write: u64,
     tx_publish: u64,
     tx_completed: u64,
+    /// Peer TX writes straight into registered arena chunks. Each chunk is
+    /// sealed as one frame before publication; its prefix is wire headroom.
+    /// Host DMA endpoints keep using the contiguous staging fields above.
+    tx_chunks: Option<VecDeque<TxChunk>>,
+    tx_chunk_request: bool,
     /// Connection torn down: the staging pointer is no longer valid.
     tx_dead: bool,
 
@@ -348,10 +363,10 @@ pub struct DmeshIoHandle {
     inner: Arc<Mutex<Inner>>,
 }
 
-// SAFETY: `staging_base` / `tx_base` are raw addresses into DMA regions that
-// outlive the connection (`clear_tx_staging` marks tx dead before the C side
-// frees it); access is serialized by the `Mutex`, with a single logical reader
-// and a single logical writer.
+// SAFETY: staging addresses and peer arena chunk pointers are owned by C.
+// `clear_tx_staging` excludes writers and removes chunk pointers before C
+// releases writable leases. Submitted chunks have independent NIC holds.
+// Access is serialized by the Mutex, with one logical reader and writer.
 unsafe impl Send for DmeshIo {}
 unsafe impl Sync for DmeshIo {}
 unsafe impl Send for DmeshIoHandle {}
@@ -451,6 +466,37 @@ impl AsyncWrite for DmeshIo {
                 "dmesh connection is shut down",
             )));
         }
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if let Some(chunks) = inner.tx_chunks.as_mut() {
+            let Some(chunk) = chunks
+                .iter_mut()
+                .find(|c| !c.sealed && c.written < c.capacity)
+            else {
+                inner.tx_waker = Some(cx.waker().clone());
+                inner.tx_chunk_request = true;
+                inner.wake_driver();
+                return Poll::Pending;
+            };
+            let n = data.len().min(chunk.capacity - chunk.written);
+            // SAFETY: C owns this exclusive writable chunk until publication or
+            // reader detach. The mutex excludes sealing/clearing its pointer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (chunk.base as *mut u8).add(chunk.written),
+                    n,
+                );
+            }
+            chunk.written += n;
+            inner.tx_write += n as u64;
+            if qdelay::on() && inner.tx_run_start == 0 {
+                inner.tx_run_start = qdelay::now_ns();
+            }
+            inner.wake_driver();
+            return Poll::Ready(Ok(n));
+        }
         // The tx staging region appears once the reverse path is set up; until
         // then writers wait (for client channels that is the same driver tick
         // that made the connection ready).
@@ -525,6 +571,41 @@ impl Drop for DmeshIo {
 }
 
 impl DmeshIoHandle {
+    /// Select peer arena TX before exposing this IO to the H2 stack.
+    pub(crate) fn enable_tx_chunks(&self) {
+        self.inner.lock().unwrap().tx_chunks = Some(VecDeque::new());
+    }
+
+    /// Prefetch a bounded number of writable chunks per connection. C also
+    /// enforces its stream byte budget and the shared worker arena limit.
+    pub(crate) fn wants_tx_chunk(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        !inner.tx_dead
+            && !inner.tx_closed
+            && inner
+                .tx_chunks
+                .as_ref()
+                .is_some_and(|chunks| chunks.len() < 8)
+    }
+
+    pub(crate) fn add_tx_chunk(&self, token: u32, base: usize, capacity: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        // A concurrent stack drop may have closed IO after C acquired the chunk.
+        // C still owns it and reclaims it during the checked detach.
+        if inner.tx_dead || inner.tx_closed {
+            return;
+        }
+        let chunks = inner.tx_chunks.as_mut().expect("peer chunk TX enabled");
+        chunks.push_back(TxChunk {
+            token,
+            base,
+            capacity,
+            ..TxChunk::default()
+        });
+        inner.tx_chunk_request = false;
+        inner.wake_writer();
+    }
+
     /// Point the reader at the connection's mapped DMA staging region. Must be
     /// set before any `push_segment`.
     pub fn set_staging(&self, base_addr: usize, len: usize) {
@@ -549,6 +630,9 @@ impl DmeshIoHandle {
         let mut inner = self.inner.lock().unwrap();
         inner.tx_dead = true;
         inner.tx_len = 0;
+        if let Some(chunks) = inner.tx_chunks.as_mut() {
+            chunks.clear();
+        }
         inner.wake_writer();
         inner.wake_driver();
     }
@@ -620,12 +704,26 @@ impl DmeshIoHandle {
     }
 
     /// Next contiguous unpublished run `[pos, pos+len)` in tx staging, if any.
+    /// In peer arena mode returns (chunk token, body bytes) and seals the chunk.
     /// Runs never cross the buffer wrap; call again after `advance_publish` to
     /// pick up the wrapped remainder. Does not consume - the driver reports
     /// what the DMA layer actually accepted via [`advance_publish`].
     pub fn take_staged(&self) -> Option<(u32, u32)> {
-        let inner = self.inner.lock().unwrap();
-        if inner.tx_dead || inner.tx_len == 0 {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.tx_dead {
+            return None;
+        }
+        if let Some(chunks) = inner.tx_chunks.as_mut() {
+            let chunk = chunks.front_mut()?;
+            if chunk.written == 0 {
+                return None;
+            }
+            // No writer can append after the driver builds this frame's header,
+            // even when carrier pressure makes publication retry on a later tick.
+            chunk.sealed = true;
+            return Some((chunk.token, chunk.written as u32));
+        }
+        if inner.tx_len == 0 {
             return None;
         }
         let unpublished = inner.tx_unpublished();
@@ -644,6 +742,13 @@ impl DmeshIoHandle {
         }
         let mut inner = self.inner.lock().unwrap();
         debug_assert!(n as u64 <= inner.tx_unpublished());
+        if let Some(chunks) = inner.tx_chunks.as_mut() {
+            let chunk = chunks.pop_front().expect("published peer chunk");
+            assert!(
+                chunk.sealed && n as usize == chunk.written,
+                "partial peer frame publication"
+            );
+        }
         inner.tx_publish += n as u64;
         if inner.tx_run_start != 0 && inner.tx_unpublished() == 0 {
             let waited = qdelay::now_ns().saturating_sub(inner.tx_run_start);
@@ -700,6 +805,10 @@ impl DmeshIoHandle {
     /// Wait for TX/FIN or consumed RX credit that the driver must publish.
     pub fn poll_driver_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.tx_chunk_request {
+            inner.tx_chunk_request = false;
+            return Poll::Ready(());
+        }
         if inner.dpu_rx_consumed_pos_changed
             || inner.tx_unpublished() > 0
             || (inner.tx_closed && !inner.fin_taken && inner.tx_completed == inner.tx_write)
@@ -719,6 +828,74 @@ mod tests {
 
     fn pair() -> (DmeshIo, DmeshIoHandle) {
         dmesh_io_pair("127.0.0.1:40000".parse().unwrap())
+    }
+
+    #[test]
+    fn peer_chunks_keep_headers_and_sealed_payloads_immutable() {
+        let (mut io, handle) = pair();
+        handle.enable_tx_chunks();
+        let mut first = vec![0x7b; 68];
+        let mut second = vec![0x7c; 68];
+        handle.add_tx_chunk(10, first.as_mut_ptr() as usize + 64, 4);
+        handle.add_tx_chunk(11, second.as_mut_ptr() as usize + 64, 4);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"ab"),
+            Poll::Ready(Ok(2))
+        ));
+        assert_eq!(handle.take_staged(), Some((10, 2)));
+        // A pressured/retried frame is sealed. Later H2 writes use the next
+        // chunk rather than changing the published length or its header bytes.
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"cdefg"),
+            Poll::Ready(Ok(4))
+        ));
+        assert_eq!(handle.take_staged(), Some((10, 2)));
+        assert_eq!(&first[64..66], b"ab");
+        assert!(first[..64].iter().all(|b| *b == 0x7b));
+        assert_eq!(&second[64..], b"cdef");
+        assert!(second[..64].iter().all(|b| *b == 0x7c));
+        handle.advance_publish(2);
+        assert_eq!(handle.take_staged(), Some((11, 4)));
+        handle.advance_publish(4);
+        handle.advance_completed(6).unwrap();
+        // An ACK does not hand old chunk pointers back to the writer. Only a
+        // new C arena lease (after NIC completion) can make memory writable.
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"g").is_pending());
+        assert!(handle.poll_driver_ready(&mut cx).is_ready());
+        assert_eq!(&first[64..66], b"ab");
+        assert_eq!(&second[64..], b"cdef");
+        assert!(Pin::new(&mut io).poll_shutdown(&mut cx).is_ready());
+        assert!(handle.take_fin());
+        handle.clear_tx_staging();
+    }
+
+    #[test]
+    fn peer_chunks_wait_for_lease_and_detach_fences_writes() {
+        let (mut io, handle) = pair();
+        handle.enable_tx_chunks();
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut io).poll_write(&mut cx, b"abc").is_pending());
+        let mut data = vec![0u8; 8];
+        handle.add_tx_chunk(1, data.as_mut_ptr() as usize, data.len());
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"abc"),
+            Poll::Ready(Ok(3))
+        ));
+        assert_eq!(handle.take_staged(), Some((1, 3)));
+        handle.advance_publish(3);
+        assert!(Pin::new(&mut io).poll_shutdown(&mut cx).is_ready());
+        assert!(!handle.take_fin());
+        handle.advance_completed(3).unwrap();
+        assert!(handle.take_fin());
+        handle.clear_tx_staging();
+        handle.add_tx_chunk(2, data.as_mut_ptr() as usize, data.len());
+        assert_eq!(handle.take_staged(), None);
+        assert!(matches!(
+            Pin::new(&mut io).poll_write(&mut cx, b"x"),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(&data[..3], b"abc");
     }
 
     /// A fake tx staging region (stands in for the mapped DMA buffer).

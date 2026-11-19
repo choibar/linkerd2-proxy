@@ -94,7 +94,12 @@ impl From<&FlowId> for DmeshTarget {
     fn from(flow: &FlowId) -> Self {
         // Parse the attested workload string into a mesh identity; an empty or
         // malformed workload yields no identity (unauthenticated).
-        let client_id = if flow.workload.is_empty() {
+        let client_id = if let Some(origin) = &flow.origin {
+            let domain = std::env::var("DPUMESH_IDENTITY_TRUST_DOMAIN")
+                .unwrap_or_else(|_| "linkerd.cluster.local".to_string());
+            identity::Id::from_str(&format!("{}.{}.serviceaccount.identity.{}",
+                origin.service_account, origin.namespace, domain)).ok().map(tls::ClientId)
+        } else if flow.workload.is_empty() {
             None
         } else {
             identity::Id::from_str(&flow.workload)
@@ -170,10 +175,11 @@ pub async fn serve<N>(
     http_wrap: DmeshHttpWrap,
     shutdown: impl Future,
 ) where
-    N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + 'static,
+    N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + Sync + 'static,
 {
     tokio::pin!(shutdown);
     let backend_owner = dmesh_doca::backend::new_owner();
+    let mut peers = dmesh_doca::peer::accept(dmesh_doca::backend::current_worker());
     // slot -> published backend address, so ConnClosed can unpublish it.
     let mut backend_slots: std::collections::HashMap<usize, SocketAddr> =
         std::collections::HashMap::new();
@@ -188,6 +194,10 @@ pub async fn serve<N>(
     loop {
         let ev = tokio::select! {
             _ = &mut shutdown => return,
+            Some(peer) = peers.recv() => {
+                serve_flow(peer.flow, peer.io, &outbound, &get_policy, &http_wrap).await;
+                continue;
+            },
             ev = events.recv() => match ev {
                 Some(ev) => ev,
                 None => return,
@@ -254,6 +264,10 @@ pub async fn serve<N>(
                 }
 
                 let target = DmeshTarget::from(&flow);
+                if flow.origin.is_some() && target.client_id().is_none() {
+                    warn!("verified Pod identity could not be mapped to the configured mesh trust domain");
+                    continue;
+                }
 
                 // INBOUND role: enforce the destination's authorization policy
                 // at the connection level before applying outbound routing.
@@ -287,17 +301,22 @@ pub async fn serve<N>(
                 // The rest of the inbound role runs per request, around this
                 // connection's HTTP service.
                 let wrap = http_wrap(&target, policy);
-                let svc = outbound.new_service(target);
+                let svc = dmesh_doca::origin::sync_scope(flow.origin.clone(), || {
+                    outbound.new_service(target)
+                });
                 let (signal, drain) = watch::channel(false);
                 migrations.insert(slot, signal);
                 let serve = http::conn_drain::scope(
                     drain,
-                    http::conn_wrap::scope(wrap, async move {
-                        match svc.oneshot(io).await {
-                            Ok(()) => debug!("dmesh connection closed"),
-                            Err(error) => debug!(%error, "dmesh connection failed"),
-                        }
-                    }),
+                    dmesh_doca::origin::scope(
+                        flow.origin,
+                        http::conn_wrap::scope(wrap, async move {
+                            match svc.oneshot(io).await {
+                                Ok(()) => debug!("dmesh connection closed"),
+                                Err(error) => debug!(%error, "dmesh connection failed"),
+                            }
+                        }),
+                    ),
                 );
                 if http::flow_stats::enabled() {
                     // Count this connection's requests, CPU and backend wait
@@ -336,4 +355,44 @@ pub async fn serve<N>(
             }
         }
     }
+}
+
+async fn serve_flow<N>(
+    flow: FlowId,
+    io: DmeshIo,
+    outbound: &N,
+    get_policy: &DmeshGetPolicy,
+    http_wrap: &DmeshHttpWrap,
+) where
+    N: NewService<DmeshTarget, Service = svc::BoxTcp<DmeshIo>> + Send + Sync + 'static,
+{
+    let target = DmeshTarget::from(&flow);
+    if flow.origin.is_some() && target.client_id().is_none() {
+        warn!("verified Pod identity could not be mapped to the configured mesh trust domain");
+        return;
+    }
+    let mut policy = get_policy(target.param());
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), policy.changed()).await;
+    let tls: tls::ConditionalServerTls = target.param();
+    let client: Remote<ClientAddr> = target.param();
+    if !dmesh_connection_authorized(&policy, client, &tls) {
+        info!(src = %flow.src, dst = %flow.dst, server = ?policy.server_label(),
+            "dmesh inbound authz DENIED; closing connection");
+        return;
+    }
+    let span = debug_span!("dmesh", src = %flow.src, orig_dst = %flow.dst);
+    let wrap = http_wrap(&target, policy);
+    let svc = dmesh_doca::origin::sync_scope(flow.origin.clone(), || outbound.new_service(target));
+    tokio::spawn(
+        dmesh_doca::origin::scope(
+            flow.origin,
+            http::conn_wrap::scope(wrap, async move {
+                match svc.oneshot(io).await {
+                    Ok(()) => debug!("dmesh connection closed"),
+                    Err(error) => debug!(%error, "dmesh connection failed"),
+                }
+            }),
+        )
+        .instrument(span),
+    );
 }
